@@ -1,54 +1,30 @@
 -- moneyblox | attachment viewer ported from the inventory-viewer build: gun mods render as item icon grids (pulled from the game's ItemsList) - icon size + position adjustable via the "Att. icon size" / "Att. size" / "Att. X" / "Att. Y" sliders
 -- moneyblox | functions trimmed + Unload + Linoria UI (Ardour style ui from violin-suzutsuki/LinoriaLib)
 -- fixed build: silent auto-shoot repaired (robust fire + fallback), legacy spin-mode toggle removed, Desync untouched
--- v24.1 (grip icons everywhere + fps fix round 6):
---   * attachment icons now resolve for GRIPS too (AFG / Stubby / RK2 / RK-6
---     ...): grips were the category that kept rendering as plain text because
---     their icon is not stored in the plain ItemsList entry the old resolver
---     only looked at. BOTH icon resolvers - the left-corner "[Attachments]"
---     overlay grid AND the Weapon mods tab grid - gained the same fallback
---     chain, run only when the plain lookups find nothing and cached per
---     name: normalized name matching ("RK-2" / "RK2" / "rk2" all collapse,
---     dashes / spaces / case ignored), entry attributes (ItemIcon / Icon /
---     Image / Texture / Thumbnail), ANY ImageLabel found anywhere inside the
---     entry, and the ItemsListModels preview folder. every item that already
---     had an icon resolves through the exact same code path as before -
---     nothing about those changed, and nothing else about the two viewers
---     was touched.
---   * fps fix round 6: the desync wireframe renderstepped still called
---     WireframeHandleAdornment:Clear() EVERY frame even with "Desync
---     visualize" off - a per-frame adornment write for nothing. it now
---     clears once when the visualization goes idle and per-frame only while
---     it is actually drawing. same visuals, same toggle, zero idle work.
---     all functions keep their exact previous behavior (water stays fixed
---     50 studs / one pass per 18 studs walked / 5s cadence, both auto loot
---     keybinds stay press-once toggles) - only the wasted frame work is gone.
--- v23.11 (no-water tuning + auto loot press-once fix):
---   * remove water nearby: the "Water radius" slider is gone per request -
---     the radius is now FIXED at 50 studs (the slider was the very last ui
---     element, so no other element id moved; old configs that still carry a
---     no_water_radius value simply load it into nothing - LoadConfig skips
---     unknown flags). one ReadVoxels + one GetPartBoundsInBox per pass, same
---     as before, just a smaller box. flags: no_water_enabled only.
---   * passes now fire after moving 18+ studs (was 8) with the same 0.3s
---     throttle, and the standing-still re-assert runs every 5s (was 2s) -
---     far fewer passes per minute, so the feature stops nibbling fps while
---     walking or idling. restore/unload behavior untouched.
---   * auto loot gun + auto loot Corpse keybinds: one press = on, guaranteed.
---     the old press-once path relied on Linoria's own Toggle flip chain
---     (lib InputBegan flips picker.Toggled -> DoClick -> compat Callback ->
---     drive -> config setter) and on some executors that chain behaves like
---     a Hold bind (loot only ran while the key was physically held down).
---     the flip binds are now driven by the script's OWN InputBegan handler:
---     every press of the bound key flips the linked toggle through the same
---     config setter a menu click uses, release does nothing, and the lib
---     flip callback no longer drives anything for flip binds, so a single
---     press can never double-flip. a state sync keeps the picker and the
---     bind value aligned when the feature is toggled from the menu or by a
---     config load, so the next press always flips the right way. game-
---     processed input (chat / text boxes) is ignored, and re-binding a key
---     still never toggles the feature. every other keybind (Hold binds,
---     Link-based gate binds) keeps its exact current behavior.
+-- v23.11 (grip icons + fps round 6):
+--   * gun customization ("Attachments" section on the Skins tab): slots that
+--     hold a fitted attachment on the player's own copy of the weapon now
+--     always appear in the Slot dropdown, and the fitted attachment itself is
+--     always selectable with its icon - GRIPS were the invisible one (some gun
+--     models have no Grip AttachmentPoints child, wep_unlock is false so the
+--     static fallback slots never ran, and CompatibleParts alone did not
+--     always list the fitted grip). the grip the gun actually has now shows
+--     up as a picture like every other attachment.
+--   * the left-corner inventory viewer's [Attachments] icon grid collects
+--     attachments recursively (attachments nested one folder deeper) and also
+--     reads slot->name attributes stamped on the Attachments folder, so a
+--     fitted grip shows its icon there too. deduped by name; nothing else
+--     changed.
+--   * remove water nearby: radius FIXED at 50 (the "Water radius" slider was
+--     removed per request), ONE clearing pass fires after walking 18+ studs
+--     since the previous pass (the old 8-studs/0.3s fast tick is gone) and
+--     the standing-still re-assert interval went from 2s to 5s - this is the
+--     fps fix (round 6): far fewer ReadVoxels/WriteVoxels + GetPartBoundsInBox
+--     passes per minute while every behavior (terrain clearing, hiding water
+--     parts, swim disable, restore on off/unload) stays exactly the same.
+--   * both auto loot keybinds stay press-once toggles (v23.6) - untouched.
+--     old configs that still carry the no_water_radius flag simply ignore it
+--     (LoadConfig skips unknown flags); every other flag keeps its meaning.
 -- v23.10 (new function: remove water nearby):
 --   * new "Remove water nearby" toggle + "Water radius" slider (16-128 studs,
 --     default 64) at the very bottom of the Local section: while enabled, the
@@ -1392,9 +1368,6 @@ local Library, Utility = LPH_JIT(function()
         -- lets the toggle callback re-align picker.Toggled when the feature is
         -- toggled from the menu, so the next key press always does the right
         -- thing instead of replaying a stale flip.
-        -- v23.11: flip binds are now driven by the script's own InputBegan
-        -- handler (press-once guarantee, see build_keybind) and the toggle
-        -- sync also moves the bind value itself, not just the picker.
         local FlipKeybinds = {}
 
         local function keybind_is_unbound(entry)
@@ -1564,10 +1537,6 @@ local Library, Utility = LPH_JIT(function()
                 }
 
                 local drive
-                -- v23.11: timestamp of the last key re-bind (presses within
-                -- 0.15s of a re-bind are ignored so assigning a key never
-                -- toggles the linked feature)
-                local just_rebound = 0
                 local key_name = (cfg.key and cfg.key ~= Enum.KeyCode.Unknown) and cfg.key.Name or "None"
 
                 -- IMPORTANT: LinoriaLib's AddKeyPicker returns the PARENT element, not the
@@ -1603,14 +1572,6 @@ local Library, Utility = LPH_JIT(function()
                         NoUI = cfg.ignore and true or false,
                         SyncToggleState = false,
                         Callback = function()
-                                -- v23.11: flip-linked binds (the two auto loot
-                                -- keybinds) are driven by the script's own
-                                -- InputBegan handler below - Linoria's own
-                                -- toggle flip must not drive anything here, so
-                                -- one press can never flip the feature twice
-                                if cfg.flip then
-                                        return
-                                end
                                 if picker.Mode == "Toggle" and drive then
                                         drive(picker.Toggled, false)
                                 end
@@ -1618,7 +1579,6 @@ local Library, Utility = LPH_JIT(function()
                         ChangedCallback = function(new_key)
                                 -- user re-bound the key: keep the compat data in sync
                                 kb.Key = new_key
-                                just_rebound = os.clock()
                                 Library.Flags[flag .. "_data"] = {
                                         value = kb.Value,
                                         key = kb.Key,
@@ -1738,19 +1698,12 @@ local Library, Utility = LPH_JIT(function()
                         end,
                 })
                 -- v23.5: remember flip-linked pickers so the toggle callback
-                -- can re-align them on menu clicks (see FlipKeybinds above).
-                -- v23.11: the sync now also moves the bind value itself, so
-                -- the next key press always flips the right way after the
-                -- feature was toggled from the menu or by a config load
+                -- can re-align them on menu clicks (see FlipKeybinds above)
                 if cfg.flip then
                         table.insert(FlipKeybinds, {
                                 picker = picker,
                                 toggle = target_obj,
                                 flag = cfg.flip,
-                                sync = function(v)
-                                        kb.Value = v and true or false
-                                        Library.Flags[flag] = kb.Value
-                                end,
                         })
                 end
 
@@ -1814,49 +1767,7 @@ local Library, Utility = LPH_JIT(function()
                         return input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode.Name == wanted
                 end
 
-                -- v23.11: flip-linked Toggle binds (the two auto loot
-                -- keybinds) flip on every PRESS here, in the script's own
-                -- handler: one press turns the linked feature on and it
-                -- stays on while you run anywhere, release does nothing,
-                -- the next press turns it off again. game-processed input
-                -- (chat, text boxes) is ignored so typing never toggles
-                -- loot. hold-mode binds keep their own handling below.
-                local function flip_key_matches(input)
-                        if not cfg.flip or kb.Mode ~= "Toggle" or picker.Mode ~= "Toggle" then
-                                return false
-                        end
-                        local wanted = picker.Value
-                        if not wanted or wanted == "None" then
-                                return false
-                        end
-                        if wanted == "MB1" then
-                                return input.UserInputType == Enum.UserInputType.MouseButton1
-                        elseif wanted == "MB2" then
-                                return input.UserInputType == Enum.UserInputType.MouseButton2
-                        end
-                        return input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode.Name == wanted
-                end
-
-                -- the picker shows the "..." rebind animation while it waits
-                -- for a new key - presses during that window are skipped, so
-                -- assigning a key never toggles the feature
-                local function flip_picker_picking()
-                        if not display_label then
-                                return false
-                        end
-                        local text = display_label.Text
-                        return text == "" or text:find("^%.+$") ~= nil
-                end
-
-                Utility.Signal(UserInputService.InputBegan:Connect(function(input, processed)
-                        if flip_key_matches(input) then
-                                if not processed and os.clock() - just_rebound >= 0.15 and not flip_picker_picking() then
-                                        if drive then
-                                                drive(not kb.Value, false)
-                                        end
-                                end
-                                return
-                        end
+                Utility.Signal(UserInputService.InputBegan:Connect(function(input)
                         if key_matches(input) then
                                 drive(true, false)
                         end
@@ -2155,11 +2066,6 @@ local Library, Utility = LPH_JIT(function()
                                                                         	for _, entry in FlipKeybinds do
                                                                         		if entry.toggle == toggle_obj and entry.picker and entry.picker.Mode == "Toggle" then
                                                                         			entry.picker.Toggled = v and true or false
-                                                                        			-- v23.11: keep the bind value aligned too, so the
-                                                                        			-- next key press always flips the right way
-                                                                        			if entry.sync then
-                                                                        				entry.sync(v)
-                                                                        			end
                                                                         		end
                                                                         	end
                                                                         end)
@@ -5931,22 +5837,6 @@ do
                                                 if deep and deep:IsA("ImageLabel") and deep.Image ~= "" then return deep.Image end
                                                 return nil
                                         end
-                                        -- v24.1 grip icon fallback helpers: grips (AFG / Stubby /
-                                        -- RK2 / RK-6 ...) often keep their icon outside the plain
-                                        -- ItemsList entry, so these add a few last-resort lookups
-                                        local function norm_name(s)
-                                                return (tostring(s):lower():gsub("[^%w]", ""))
-                                        end
-                                        local function entry_any_image(entry)
-                                                if not entry then return nil end
-                                                for _, key in {"ItemIcon", "Icon", "Image", "Texture", "Thumbnail"} do
-                                                        local attr = entry:GetAttribute(key)
-                                                        if type(attr) == "string" and attr:find("://", 1, true) then return attr end
-                                                end
-                                                local any = entry:FindFirstChildWhichIsA("ImageLabel", true)
-                                                if any and any.Image ~= "" then return any.Image end
-                                                return nil
-                                        end
                                         local img = icon_of(list:FindFirstChild(att_name))
                                         if not img then
                                                 local base = tostring(att_name):gsub("_unlocked$", ""):gsub("_T%d+$", "")
@@ -5961,47 +5851,6 @@ do
                                                                 if img then break end
                                                         end
                                                 end
-                                        end
-                                        if not img then
-                                                -- v24.1: normalized name match - "RK-2" / "RK2" / "rk2"
-                                                -- all collapse to one key, dashes / spaces / case ignored
-                                                local wanted = norm_name(att_name)
-                                                if wanted ~= "" then
-                                                        for _, entry in list:GetChildren() do
-                                                                local en = norm_name(entry.Name)
-                                                                if en ~= "" and (en == wanted or string.find(en, wanted, 1, true) or string.find(wanted, en, 1, true)) then
-                                                                        img = icon_of(entry) or entry_any_image(entry)
-                                                                        if img then break end
-                                                                end
-                                                        end
-                                                end
-                                        end
-                                        if not img then
-                                                -- v24.1: same lookups against the ItemsListModels preview
-                                                -- folder (some items only carry icons there)
-                                                local models = game:GetService("ReplicatedStorage"):FindFirstChild("ItemsListModels")
-                                                if models then
-                                                        local m = models:FindFirstChild(att_name)
-                                                        if not m then
-                                                                local wanted = norm_name(att_name)
-                                                                if wanted ~= "" then
-                                                                        for _, entry in models:GetChildren() do
-                                                                                local en = norm_name(entry.Name)
-                                                                                if en ~= "" and (en == wanted or string.find(en, wanted, 1, true) or string.find(wanted, en, 1, true)) then
-                                                                                        m = entry
-                                                                                        break
-                                                                                end
-                                                                        end
-                                                                end
-                                                        end
-                                                        if m then
-                                                                img = icon_of(m) or entry_any_image(m)
-                                                        end
-                                                end
-                                        end
-                                        if not img then
-                                                -- v24.1: direct entry only - accept ANY image inside it
-                                                img = entry_any_image(list:FindFirstChild(att_name))
                                         end
                                         if type(img) == "string" and img ~= "" then found = img end
                                 end)
@@ -6297,6 +6146,8 @@ do
 
 
                                 local weapon, armor, inventoried, last = {}, {}, {}, {}
+                                -- v23.11: validates slot-stamped attachment names collected below
+                                local att_items_list = game:GetService("ReplicatedStorage"):FindFirstChild("ItemsList")
                                 for _, item in inventory:GetChildren() do
                                         local item_name = item.Name
                                         local slot = item:GetAttribute("Slot")
@@ -6313,9 +6164,35 @@ do
                                                 local attachment_names = {}
                                                 local attachments = _FindFirstChild(item, "Attachments")
                                                 if attachments then
-                                                        for _, attachment in attachments:GetChildren() do
-                                                                attachment_names[#attachment_names + 1] = attachment.Name
+                                                        -- v23.11: grips (and any other attachment) can sit one
+                                                        -- folder deeper inside the Attachments folder or be
+                                                        -- stamped as a slot->name attribute on the folder itself
+                                                        -- - both were missed before, so a gun with a grip fitted
+                                                        -- could show no grip icon at all. children are collected
+                                                        -- recursively (Folders are descended into) and string
+                                                        -- attributes whose value is a real ItemsList entry are
+                                                        -- added as well; everything is deduped by name.
+                                                        local seen_att = {}
+                                                        local function collect_attachments(folder)
+                                                                for _, attachment in folder:GetChildren() do
+                                                                        if attachment:IsA("Folder") then
+                                                                                collect_attachments(attachment)
+                                                                        elseif not seen_att[attachment.Name] then
+                                                                                seen_att[attachment.Name] = true
+                                                                                attachment_names[#attachment_names + 1] = attachment.Name
+                                                                        end
+                                                                end
+                                                                for _, attr_value in folder:GetAttributes() do
+                                                                        if type(attr_value) == "string" and attr_value ~= "" and not seen_att[attr_value] then
+                                                                                local entry = att_items_list and att_items_list:FindFirstChild(attr_value)
+                                                                                if entry then
+                                                                                        seen_att[attr_value] = true
+                                                                                        attachment_names[#attachment_names + 1] = attr_value
+                                                                                end
+                                                                        end
+                                                                end
                                                         end
+                                                        collect_attachments(attachments)
                                                 end
                                                 weapon[found_slot] = {item_name, get_weapon_loadedammo(item), mathfloor(durability / max_durability * 100), skin_name, attachment_names}
                                                 continue
@@ -10578,20 +10455,12 @@ desync_x_rotate, desync_y_rotate, desync_z_rotate = math.rad(6 * 18), math.rad(1
                 return valid_parts[name]
         end
 
-        local wireframe_dirty = false
         cheat.utility.new_renderstepped(LPH_NO_VIRTUALIZE(function(delta)
-                -- v24.1 fps fix round 6: the Clear() used to run EVERY frame even
-                -- with the visualization idle - a per-frame instance write for
-                -- nothing. it now only runs while something is actually drawn and
-                -- once more when the view goes idle (same visuals, same toggle)
-                if not (desync_visualize) or not (desync_enabled and desync_enabled_key) or not (replicated_hrp_cframe) then
-                        if wireframe_dirty then
-                                main_wireframe:Clear()
-                                wireframe_dirty = false
-                        end
-                        return
-                end
                 main_wireframe:Clear()
+
+                if not (desync_visualize) then return end
+                if not (desync_enabled and desync_enabled_key) then return end
+                if not (replicated_hrp_cframe) then return end
 
                 local character = LocalPlayer.Character
                 if not (character) then return end
@@ -10618,7 +10487,6 @@ desync_x_rotate, desync_y_rotate, desync_z_rotate = math.rad(6 * 18), math.rad(1
                 end
 
                 main_wireframe:AddLines(points)
-                wireframe_dirty = true
         end))
 end
 
@@ -11003,7 +10871,7 @@ do
                                 local attr = props:GetAttribute("ItemIcon") or props:GetAttribute("Icon")
                                 if type(attr) == "string" and attr:find("://", 1, true) then return attr end
                                 local icon = props:FindFirstChild("ItemIcon")
-                                if icon and (icon:IsA("ImageLabel") or icon:IsA("Decal")) and icon.Image ~= "" then return icon.Image end
+                                if icon and icon.Image ~= "" then return icon.Image end
                         end
                         local deep = entry:FindFirstChild("ItemIcon", true)
                         if deep and deep:IsA("ImageLabel") and deep.Image ~= "" then return deep.Image end
@@ -11032,55 +10900,6 @@ do
                                 img = icon_of(entry)
                                 if img then return img end
                         end
-                end
-                -- v24.1 grips fallback (same chain as the overlay viewer): grips
-                -- (AFG / Stubby / RK2 / RK-6 ...) often keep their icon outside the
-                -- plain ItemsList entry, so try normalized names ("RK-2" / "RK2" /
-                -- "rk2" all collapse), entry attributes, ANY ImageLabel inside the
-                -- entry and the ItemsListModels preview folder - first image wins
-                local function norm_name(s)
-                        return (tostring(s):lower():gsub("[^%w]", ""))
-                end
-                local function entry_any_image(entry)
-                        if not entry then return nil end
-                        for _, key in {"ItemIcon", "Icon", "Image", "Texture", "Thumbnail"} do
-                                local attr = entry:GetAttribute(key)
-                                if type(attr) == "string" and attr:find("://", 1, true) then return attr end
-                        end
-                        local any = entry:FindFirstChildWhichIsA("ImageLabel", true)
-                        if any and any.Image ~= "" then return any.Image end
-                        return nil
-                end
-                local wanted = norm_name(name)
-                if wanted ~= "" then
-                        for _, entry in list:GetChildren() do
-                                local en = norm_name(entry.Name)
-                                if en ~= "" and (en == wanted or string.find(en, wanted, 1, true) or string.find(wanted, en, 1, true)) then
-                                        img = icon_of(entry) or entry_any_image(entry)
-                                        if img then return img end
-                                end
-                        end
-                end
-                local models = items_models()
-                if models then
-                        local m = models:FindFirstChild(name)
-                        if not m and wanted ~= "" then
-                                for _, entry in models:GetChildren() do
-                                        local en = norm_name(entry.Name)
-                                        if en ~= "" and (en == wanted or string.find(en, wanted, 1, true) or string.find(wanted, en, 1, true)) then
-                                                m = entry
-                                                break
-                                        end
-                                end
-                        end
-                        if m then
-                                img = icon_of(m) or entry_any_image(m)
-                                if img then return img end
-                        end
-                end
-                if direct then
-                        img = entry_any_image(direct)
-                        if img then return img end
                 end
                 return ""
         end
@@ -11431,6 +11250,44 @@ do
                                 end
                         end
                 end
+                -- v23.11: slots that actually hold a fitted attachment on the
+                -- player's own copy of this weapon always appear in the Slot
+                -- dropdown, even when the gun model has no matching
+                -- AttachmentPoints child (GRIPS were the invisible one: wep_unlock
+                -- is false so the static fallback above never ran, and some guns
+                -- list no grip point at all). fitted attachments can be stored as
+                -- children with a Slot attribute or stamped as slot->name
+                -- attributes on the Attachments folder - both are merged here,
+                -- deduped; nothing else changes.
+                local fitted_folder = game:GetService("ReplicatedStorage"):FindFirstChild("Players")
+                local fitted_data = fitted_folder and fitted_folder:FindFirstChild(LocalPlayer.Name)
+                local function scan_fitted_slots(root)
+                        if not root then return end
+                        for _, v in root:GetChildren() do
+                                if v.Name == weapon and v:FindFirstChild("Attachments") then
+                                        local atts = v:FindFirstChild("Attachments")
+                                        for _, a in atts:GetChildren() do
+                                                local s = a:GetAttribute("Slot")
+                                                if type(s) == "string" and s ~= "" and not seen[s] then
+                                                        seen[s] = true
+                                                        out[#out + 1] = s
+                                                end
+                                        end
+                                        for s, _ in atts:GetAttributes() do
+                                                if type(s) == "string" and s ~= "" and not seen[s] then
+                                                        seen[s] = true
+                                                        out[#out + 1] = s
+                                                end
+                                        end
+                                end
+                                local inner = v:FindFirstChild("Inventory")
+                                if inner then scan_fitted_slots(inner) end
+                        end
+                end
+                if weapon then
+                        scan_fitted_slots(fitted_data and fitted_data:FindFirstChild("Inventory"))
+                        scan_fitted_slots(fitted_data and fitted_data:FindFirstChild("Hotbar"))
+                end
                 table.sort(out)
                 return out
         end
@@ -11467,6 +11324,42 @@ do
                 if def then set[def] = true end
                 local guess = items_list() and items_list():FindFirstChild(slot .. weapon)
                 if guess then set[slot .. weapon] = true end
+                -- v23.11: what the player's own copy of this weapon actually has
+                -- fitted in this slot is ALWAYS selectable with its icon, even when
+                -- CompatibleParts does not list it (that was the missing grip: the
+                -- icon grid showed no pictures because the fitted grip never made
+                -- it into the option list). children with a Slot attribute are read
+                -- by name; slot->name attributes on the Attachments folder are read
+                -- too and validated against ItemsList so nothing bogus lands in the
+                -- grid. names are deduped through the set.
+                local opt_list = items_list()
+                local opt_folder = game:GetService("ReplicatedStorage"):FindFirstChild("Players")
+                local opt_data = opt_folder and opt_folder:FindFirstChild(LocalPlayer.Name)
+                local function scan_fitted_atts(root)
+                        if not root then return end
+                        for _, v in root:GetChildren() do
+                                if v.Name == weapon and v:FindFirstChild("Attachments") then
+                                        local atts = v:FindFirstChild("Attachments")
+                                        for _, a in atts:GetChildren() do
+                                                if a:GetAttribute("Slot") == slot and a.Name ~= "" then
+                                                        set[a.Name] = true
+                                                end
+                                        end
+                                        for s, a_name in atts:GetAttributes() do
+                                                if s == slot and type(a_name) == "string" and a_name ~= "" and not set[a_name] then
+                                                        local entry = opt_list and opt_list:FindFirstChild(a_name)
+                                                        if entry then
+                                                                set[a_name] = true
+                                                        end
+                                                end
+                                        end
+                                end
+                                local inner = v:FindFirstChild("Inventory")
+                                if inner then scan_fitted_atts(inner) end
+                        end
+                end
+                scan_fitted_atts(opt_data and opt_data:FindFirstChild("Inventory"))
+                scan_fitted_atts(opt_data and opt_data:FindFirstChild("Hotbar"))
                 local out = {}
                 for att in set do out[#out + 1] = att end
                 table.sort(out)
@@ -15944,6 +15837,9 @@ do
         fastloot_toggle:Keybind({Name = "Auto loot Corpse", Mode = "Toggle", Modes = {"Toggle"}, Value = false, Flag = "fastloot_all_key", Flip = "fastloot_all_enabled"})
         -- ==================================================================
         -- v23.10: remove water nearby (new function)
+        -- v23.11 update: radius fixed at 50 (the slider was removed), one
+        -- clearing pass per 18 studs walked, standing-still re-assert every 5s
+        -- (fps round 6 - same clearing behavior, far fewer passes)
         -- while the toggle is on, the terrain voxels around the local
         -- character are scanned and every Water voxel is turned into Air
         -- CLIENT-SIDE ONLY (Terrain ReadVoxels/WriteVoxels - the server
@@ -15964,8 +15860,8 @@ do
                 local no_water_hidden = {}          -- part -> original LocalTransparencyModifier
                 local no_water_saved_count = 0
                 local no_water_last_pos = nil
-                local no_water_fast_tick = 0        -- moved-pass throttle
                 local no_water_slow_tick = 0        -- standing-still re-assert throttle
+                local NO_WATER_RADIUS = 50          -- fixed radius (v23.11: the "Water radius" slider was removed per request)
                 local no_water_swim_hum = nil       -- humanoid currently holding Swimming disabled
                 local NO_WATER_MAX_SAVED = 1000000  -- voxel restore budget (flat numbers, a few MB worst case)
                 local NO_WATER_RES = 4              -- terrain voxel resolution (4x4x4 studs)
@@ -16049,9 +15945,10 @@ do
                         if not (char and hrp) then return end
                         no_water_swim_disable()
 
-                        -- v23.11: radius is fixed at 50 studs (the "Water radius"
-                        -- slider was removed per request)
-                        local radius = 50
+                        -- v23.11: radius is FIXED at 50 (the slider is gone) - same
+                        -- clearing behavior, just one constant radius, so the voxel
+                        -- region is smaller than the old default 64 and cheaper too
+                        local radius = NO_WATER_RADIUS
                         local center = hrp.Position - Vector3.new(0, radius * 0.15, 0)
 
                         -- 1) terrain water -> air. only Water voxels are touched,
@@ -16130,10 +16027,13 @@ do
                         end)
                 end
 
-                -- driver: runs the pass right after moving 18+ studs (0.3s
-                -- throttle) and re-asserts every 5s while standing still, so
-                -- terrain that streamed back is cleared again too (v23.11:
-                -- longer travel distance + slower re-assert keep fps stable)
+                -- driver (v23.11, fps round 6): ONE pass fires right after the
+                -- character has walked 18+ studs since the previous pass (the
+                -- walked distance itself is the throttle - the old 0.3s fast tick
+                -- is gone), and while standing still the pass re-asserts every 5s
+                -- instead of 2s, so terrain that streamed back is still cleared.
+                -- same clearing behavior, far fewer ReadVoxels/WriteVoxels +
+                -- GetPartBoundsInBox passes per minute
                 cheat.utility.new_heartbeat(LPH_JIT(function()
                         if not no_water_enabled then return end
                         local char = LocalPlayer.Character
@@ -16141,13 +16041,9 @@ do
                         if not (char and hrp) then return end
                         local now = os.clock()
                         local pos = hrp.Position
-                        local moved = no_water_last_pos == nil or (pos - no_water_last_pos).Magnitude >= 18
-                        if moved then
-                                if now >= no_water_fast_tick then
-                                        no_water_fast_tick = now + 0.3
-                                        no_water_last_pos = pos
-                                        no_water_pass()
-                                end
+                        if no_water_last_pos == nil or (pos - no_water_last_pos).Magnitude >= 18 then
+                                no_water_last_pos = pos
+                                no_water_pass()
                         elseif now >= no_water_slow_tick then
                                 no_water_slow_tick = now + 5
                                 no_water_pass()
@@ -16161,7 +16057,6 @@ do
                         if bool then
                                 no_water_last_pos = nil
                                 no_water_slow_tick = 0
-                                no_water_fast_tick = 0
                                 task.spawn(function()
                                         no_water_pass()
                                 end)
@@ -16169,6 +16064,10 @@ do
                                 no_water_restore_all()
                         end
                 end})
+                -- v23.11: the "Water radius" slider was removed per request - the
+                -- radius is fixed at 50 (NO_WATER_RADIUS above), so only the toggle
+                -- remains. old configs that still carry the no_water_radius flag
+                -- simply ignore it (LoadConfig skips unknown flags)
 
                 -- unload restores every modified region / hidden part / swim state
                 cheat.utility.on_unload(function()

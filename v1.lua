@@ -2560,9 +2560,7 @@ local Library, Utility = LPH_JIT(function()
                                         .. tostring(first_error) .. ")", 8)
                         end
                         if missing_count > 0 then
-                                Library.Notification("This config is outdated: "
-                                        .. missing_count .. " current setting(s) are not in it"
-                                        .. " - re-create the config to save them", 8)
+                                
                         end
                 end)
 
@@ -11691,7 +11689,7 @@ do
                 wep_edits = tostring(v or "")
                 Library.Flags["weapon_edits"] = wep_edits
                 local n = wep_apply_all()
-                Library.Notification("Weapon edits loaded (" .. n .. " stamped)", 3)
+                
         end
         local wep_auto_tick = 0
         cheat.utility.new_heartbeat(function()

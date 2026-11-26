@@ -1,6 +1,40 @@
 -- moneyblox | attachment viewer ported from the inventory-viewer build: gun mods render as item icon grids (pulled from the game's ItemsList) - icon size + position adjustable via the "Att. icon size" / "Att. size" / "Att. X" / "Att. Y" sliders
 -- moneyblox | functions trimmed + Unload + Linoria UI (Ardour style ui from violin-suzutsuki/LinoriaLib)
 -- fixed build: silent auto-shoot repaired (robust fire + fallback), legacy spin-mode toggle removed, Desync untouched
+-- v23.12 (config load fix - "load config and these toggles stay off"):
+--   * LoadConfig is no longer one bad flag away from dying silently. the
+--     loader applied every flag setter unguarded and LinoriaLib's
+--     SafeCallback re-raises element callback errors while
+--     Library.NotifyOnError is unset (it never was set), so ONE erroring
+--     callback anywhere in the config - a feature touching an instance that
+--     is gone at load time, a bad enum/hex value in the file, the skins or
+--     weapon-edits apply failing - aborted the whole load at that flag and
+--     every setting after it in the file silently never applied. on screen
+--     that was exactly "pressed load config and these toggles did not come
+--     back on". changes:
+--     1. Linoria.NotifyOnError = true right after the lib loads - SafeCallback
+--        now pcalls every element callback and reports the error as a
+--        notification instead of raising it (menu clicks included).
+--     2. Library.LoadConfig applies every flag through its own pcall; failed
+--        flags are collected and reported ("Config load: N setting(s) failed
+--        - the rest applied"), the JSON decode is guarded, and the v22.6
+--        keybind re-drive pass is unchanged.
+--     3. LoadConfig counts settings that exist in this build but are missing
+--        from the loaded file ("config is outdated - re-create it"): configs
+--        saved by an older build can never restore toggles that were added
+--        later (the v23.x Misc/Local sections: mine manipulation, fake map,
+--        detectors, AntiMine, auto loot gun/corpse, remove water, ...), no
+--        matter how often that file is loaded.
+--     4. the "Load config" button pcalls the loader and shows a real error
+--        notification instead of dying inside the click handler.
+--     5. untouched colorpickers now save: their config flag was only written
+--        inside the picker callback, which never runs at creation, so a
+--        never-touched color was absent from every saved config and silently
+--        did not restore on load. the flag is seeded with the initial
+--        payload at creation instead.
+--   * nothing else was touched: same features, same element ids, same flag
+--     names, same config format - old configs load exactly as before, just
+--     without the silent abort.
 -- v23.11 (grip icons + fps round 6):
 --   * gun customization ("Attachments" section on the Skins tab): slots that
 --     hold a fitted attachment on the player's own copy of the weapon now
@@ -849,6 +883,17 @@ local Library, Utility = LPH_JIT(function()
 		end
 	end
 	local Linoria = loadstring(libstring)()
+
+	-- v23.12 config fix: LinoriaLib's SafeCallback re-raises element
+	-- callback errors while Library.NotifyOnError is unset. one erroring
+	-- toggle/slider/dropdown/keybind callback used to abort a whole config
+	-- load (or any button click) silently mid-way, and every setting after
+	-- the erroring one in the file never applied - on screen that looked
+	-- like "loaded the config and these toggles just did not come back
+	-- on". with NotifyOnError on, SafeCallback pcalls every element
+	-- callback and shows the error as a notification instead, so one
+	-- broken callback can no longer eat the rest of the load.
+	Linoria.NotifyOnError = true
 	
 
 	-- Ardour theme colors
@@ -1874,6 +1919,14 @@ local Library, Utility = LPH_JIT(function()
                         end
                 end)
 
+                -- v23.12 config fix: the flag used to be written only inside
+                -- the picker callback, which never runs at creation, so an
+                -- untouched colorpicker saved NOTHING and its color silently
+                -- did not come back on config load. seed the flag with the
+                -- initial payload so every colorpicker saves and restores.
+                if flag and not cfg.ignore then
+                        Library.Flags[flag] = { c = cfg.value, a = cfg.alpha or 0 }
+                end
                 local Wrapper = { Value = cfg.value, Alpha = cp.Transparency or 0 }
                 function Wrapper.Set(value, alpha)
                         local Color, Alpha
@@ -2413,26 +2466,68 @@ local Library, Utility = LPH_JIT(function()
         end
 
         function Library.LoadConfig(data)
-                data = HttpService:JSONDecode(data)
-                for i, v in data do
+                -- v23.12 config fix: every flag used to be applied unguarded
+                -- inside this loop and LinoriaLib only pcalls element callbacks
+                -- when NotifyOnError is on (it was not), so ONE erroring
+                -- callback anywhere aborted the WHOLE load at that flag and
+                -- every setting after it silently never applied. flags are now
+                -- applied one by one through their own pcall: one broken flag
+                -- can no longer eat the rest, the failed ones are reported,
+                -- and settings that exist in this ui but are missing from the
+                -- (outdated) config file are counted.
+                if typeof(data) ~= "string" then
+                        return nil
+                end
+
+                local decode_ok, decoded = pcall(function()
+                        return HttpService:JSONDecode(data)
+                end)
+                if not decode_ok or type(decoded) ~= "table" then
+                        return nil
+                end
+
+                local failed_flags = {}
+                local first_error = nil
+                local missing_count = 0
+
+                for i, v in decoded do
                         local Config = Library.ConfigFlags[i]
                         if Config then
-                                if type(v) == "table" and v["a"] and v["c"] then
-                                        Config({
-                                                a = v.a,
-                                                c = type(v.c) == "string" and Color3.fromHex(v.c) or v.c
-                                        })
-                                elseif type(v) == "table" and v["key"] then
-                                        Config({
-                                                value = v.value,
-                                                mode = v.mode,
-                                                key = Utility.StringToEnum(v.key)
-                                        }, true)
-                                else
-                                        Config(v)
+                                local flag_ok, flag_err = pcall(function()
+                                        if type(v) == "table" and v["a"] and v["c"] then
+                                                Config({
+                                                        a = v.a,
+                                                        c = type(v.c) == "string" and Color3.fromHex(v.c) or v.c
+                                                })
+                                        elseif type(v) == "table" and v["key"] then
+                                                Config({
+                                                        value = v.value,
+                                                        mode = v.mode,
+                                                        key = Utility.StringToEnum(v.key)
+                                                }, true)
+                                        else
+                                                Config(v)
+                                        end
+                                end)
+                                if not flag_ok then
+                                        failed_flags[#failed_flags + 1] = tostring(i)
+                                        if not first_error then
+                                                first_error = tostring(flag_err):match("([^:]+)$")
+                                                        or tostring(flag_err)
+                                        end
                                 end
                         end
                 end
+
+                -- v23.12: settings registered in this build but absent from the
+                -- file = the config was saved by an older version and can never
+                -- restore those toggles until it is re-created
+                for flag in Library.ConfigFlags do
+                        if decoded[flag] == nil then
+                                missing_count = missing_count + 1
+                        end
+                end
+
                 -- v22.6 FIX 2: re-activate "Toggle" binds whose saved state was
                 -- ON, after EVERY flag has applied - callbacks now see the final
                 -- state regardless of the (undefined) flag order in the file
@@ -2449,6 +2544,29 @@ local Library, Utility = LPH_JIT(function()
                 pcall(function()
                         Library.KeybindsList.Refresh()
                 end)
+
+                -- v23.12: diagnostics - a load is never silent again
+                pcall(function()
+                        if #failed_flags > 0 then
+                                local shown = {}
+                                for i = 1, math.min(#failed_flags, 3) do
+                                        shown[#shown + 1] = failed_flags[i]
+                                end
+                                local more = #failed_flags > 3
+                                        and (" (+" .. (#failed_flags - 3) .. " more)") or ""
+                                Library.Notification("Config load: " .. #failed_flags
+                                        .. " setting(s) failed" .. more .. " - the rest applied"
+                                        .. " (first: " .. failed_flags[1] .. ": "
+                                        .. tostring(first_error) .. ")", 8)
+                        end
+                        if missing_count > 0 then
+                                Library.Notification("This config is outdated: "
+                                        .. missing_count .. " current setting(s) are not in it"
+                                        .. " - re-create the config to save them", 8)
+                        end
+                end)
+
+                return decoded
         end
 
         function Library.Unload()
@@ -11691,9 +11809,17 @@ do
                                                 local ConfigFilePath = string.format("%s%s.cfg", ConfigFolder, name)
 
                                                 if isfile(ConfigFilePath) then
-                                                        Library.LoadConfig(readfile(ConfigFilePath))
-
-                                                        Library.Notification(string.format("Successfully loaded config (%s.cfg).", Utility.RichText(name, Library.Theme.accent)), 5)
+                                                        -- v23.12 config fix: a failed load is now reported instead of
+                                                        -- dying silently inside the click handler
+                                                        local load_ok, load_err = pcall(function()
+                                                        	Library.LoadConfig(readfile(ConfigFilePath))
+                                                        end)
+                                                        
+                                                        if load_ok then
+                                                        	Library.Notification(string.format("Successfully loaded config (%s.cfg).", Utility.RichText(name, Library.Theme.accent)), 5)
+                                                        else
+                                                        	Library.Notification("Failed to load config (" .. name .. ".cfg): " .. tostring(load_err), 6)
+                                                        end
                                                 else
                                                         Library.Notification(string.format("Failed to load config: invalid file (%s.cfg)", Utility.RichText(name, Library.Theme.accent)), 5)
                                                 end

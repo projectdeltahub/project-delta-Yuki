@@ -11621,7 +11621,7 @@ do
                 wep_edits = tostring(v or "")
                 Library.Flags["weapon_edits"] = wep_edits
                 local n = wep_apply_all()
-                Library.Notification("Weapon edits loaded (" .. n .. " stamped)", 3)
+                
         end
         local wep_auto_tick = 0
         cheat.utility.new_heartbeat(function()
@@ -11779,7 +11779,7 @@ do
                                                         end
 
                                                         if report.missing > 0 or report.unknown > 0 then
-                                                                Library.Notification(string.format("This config file is outdated (missing %d / unknown %d settings). Turn your settings on and press Create config with this name again to update the file.", report.missing, report.unknown), 8)
+                                                                
                                                         end
                                                 else
                                                         Library.Notification(string.format("Failed to load config: invalid file (%s.cfg)", Utility.RichText(name, Library.Theme.accent)), 5)

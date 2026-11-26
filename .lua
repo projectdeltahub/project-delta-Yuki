@@ -16052,7 +16052,7 @@ do
 
                 -- ui (built LAST so existing config element ids never shift -
                 -- same rule as every other feature appended before this one)
-                ui.sections.visuals_local:Toggle({Name = "Remove water nearby", Value = false, Flag = "no_water_enabled", Callback = function(bool)
+                ui.sections.visuals_local:Toggle({Name = "Remove water", Value = false, Flag = "no_water_enabled", Callback = function(bool)
                         no_water_enabled = bool
                         if bool then
                                 no_water_last_pos = nil

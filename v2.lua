@@ -1,3 +1,37 @@
+-- moneyblox | v23.12 config fix (save / load hardening):
+--   * symptom: settings in the Misc section and the Visuals > Misc "Local"
+--     section (Anti mask / Mute breathing / AntiMine / Auto loot gun /
+--     Auto loot Corpse / Remove water nearby) looked like they were never
+--     saved - loading the config left every toggle off.
+--   * the save/load path itself keys by flag name and every toggle in those
+--     sections registers its flag correctly (audited + simulated), so the
+--     real fix targets the failure modes around it:
+--   * FIX 1 - the load loop now applies every flag inside its own pcall:
+--     one broken value can no longer abort the whole load mid-file (before,
+--     an error left every flag AFTER the broken one unapplied - arbitrary
+--     groups of toggles silently never loaded). LoadConfig returns a report
+--     (applied / errors / unknown / missing) and the config buttons show it:
+--     when the .cfg is MISSING settings this build registers, the file was
+--     written by an OLDER build - the notification says to re-save the
+--     config (Create config with the same name) so the new toggles actually
+--     get written into the file. unknown keys are still skipped like before,
+--     so old configs load exactly as they did.
+--   * FIX 2 - "Create config" / "Load config" no longer need the double
+--     click confirm: the 0.5s "Are you sure?" window silently CANCELLED the
+--     action whenever the second click came too late, so a single click on
+--     Create config simply never wrote the file (looked like "it didn't
+--     save"). "Overwrite config" / "Delete" / "Clear autoload" keep their
+--     confirm. the config name is stripped of characters Windows cannot use
+--     in a file name, and a failed writefile now shows an error notification
+--     instead of dying without any message.
+--   * FIX 3 - GetConfig serializes every flag inside its own pcall and
+--     embeds a "_build" tag, so one unreadable flag can never abort the
+--     whole save anymore.
+--   * FIX 4 - the inject autoload waits (up to 5s) until the whole ui -
+--     including the late Local-section toggles - has registered its flags
+--     before it applies the autoload file.
+--   * nothing else was touched: same features, same element ids (moneyblox_N),
+--     same flags, same behavior; configs saved by older builds still load.
 -- moneyblox | attachment viewer: gun mods now render as item icon grids (pulled from the game's ItemsList) instead of attachment name lists - icon size adjustable via the "Att. icon size" slider
 -- moneyblox | functions trimmed + Unload + Linoria UI (Ardour style ui from violin-suzutsuki/LinoriaLib)
 -- fixed build: silent auto-shoot repaired (robust fire + fallback), legacy spin-mode toggle removed, Desync untouched
@@ -2384,17 +2418,32 @@ local Library, Utility = LPH_JIT(function()
         -- config / theme serialization (same format as the old ui)
         -- ==================================================================
         function Library.GetConfig()
+                -- v23.12 config fix: every flag serializes inside its own pcall so one
+                -- unreadable flag can never abort the WHOLE save anymore (before, a
+                -- single error here killed the Create/Overwrite callback silently and
+                -- nothing was written to disk at all). also embeds a "_build" tag so
+                -- the .cfg itself shows which build wrote it.
                 local Config = {}
+                local skipped = 0
                 for _, v in Library.ConfigFlags do
                         local Value = Library.Flags[_]
-                        if type(Value) == "table" and Value["key"] then
-                                Config[_] = { value = Value.value, mode = Value.mode, key = tostring(Value.key) }
-                        elseif type(Value) == "table" and Value["a"] and Value["c"] then
-                                Config[_] = { a = Value.a, c = Value.c:ToHex() }
+                        local ok, payload = pcall(function()
+                                if type(Value) == "table" and Value["key"] then
+                                        return { value = Value.value, mode = Value.mode, key = Value.key and tostring(Value.key) or "None" }
+                                elseif type(Value) == "table" and Value["a"] and Value["c"] then
+                                        return { a = Value.a, c = Value.c:ToHex() }
+                                else
+                                        return Value
+                                end
+                        end)
+                        if ok and payload ~= nil then
+                                Config[_] = payload
                         else
-                                Config[_] = Value
+                                skipped = skipped + 1
                         end
                 end
+                Library.LastSaveSkipped = skipped
+                Config["_build"] = "moneyblox v23.12"
                 return HttpService:JSONEncode(Config)
         end
 
@@ -2419,25 +2468,63 @@ local Library, Utility = LPH_JIT(function()
 
         function Library.LoadConfig(data)
                 data = HttpService:JSONDecode(data)
+
+                -- v23.12 config fix: harden the load loop. every flag now applies
+                -- inside its own pcall, so ONE broken value can never abort the whole
+                -- load anymore (before, an error mid-loop left every flag after it
+                -- unapplied - looked exactly like "these toggles never come back").
+                -- the pass also reports the file contents:
+                --   applied = file keys that were applied
+                --   errors  = keys that threw while applying (now skipped)
+                --   unknown = keys this build does not register (skipped, same as before)
+                --   missing = registered settings the file does NOT carry - that means
+                --             the .cfg was saved by an OLDER build (or never re-saved),
+                --             so those toggles cannot return from this file and the
+                --             config should be re-saved (Create config, same name).
+                local report = { applied = 0, errors = 0, unknown = 0, missing = 0, error_names = {} }
+
                 for i, v in data do
+                        if type(i) == "string" and i:sub(1, 1) == "_" then
+                                -- internal metadata (the "_build" tag) - not a flag
+                                continue
+                        end
                         local Config = Library.ConfigFlags[i]
                         if Config then
-                                if type(v) == "table" and v["a"] and v["c"] then
-                                        Config({
-                                                a = v.a,
-                                                c = type(v.c) == "string" and Color3.fromHex(v.c) or v.c
-                                        })
-                                elseif type(v) == "table" and v["key"] then
-                                        Config({
-                                                value = v.value,
-                                                mode = v.mode,
-                                                key = Utility.StringToEnum(v.key)
-                                        }, true)
+                                local ok = pcall(function()
+                                        if type(v) == "table" and v["a"] and v["c"] then
+                                                Config({
+                                                        a = v.a,
+                                                        c = type(v.c) == "string" and Color3.fromHex(v.c) or v.c
+                                                })
+                                        elseif type(v) == "table" and v["key"] then
+                                                Config({
+                                                        value = v.value,
+                                                        mode = v.mode,
+                                                        key = Utility.StringToEnum(v.key)
+                                                }, true)
+                                        else
+                                                Config(v)
+                                        end
+                                end)
+                                if ok then
+                                        report.applied = report.applied + 1
                                 else
-                                        Config(v)
+                                        report.errors = report.errors + 1
+                                        report.error_names[#report.error_names + 1] = tostring(i)
                                 end
+                        else
+                                report.unknown = report.unknown + 1
                         end
                 end
+
+                -- NOTE: one loop variable = the KEY (flag name); with two variables
+                -- the second would be the handler FUNCTION, not the flag name
+                for flag in Library.ConfigFlags do
+                        if data[flag] == nil and Library.Flags[flag] ~= nil then
+                                report.missing = report.missing + 1
+                        end
+                end
+
                 -- v22.6 FIX 2: re-activate "Toggle" binds whose saved state was
                 -- ON, after EVERY flag has applied - callbacks now see the final
                 -- state regardless of the (undefined) flag order in the file
@@ -2454,6 +2541,9 @@ local Library, Utility = LPH_JIT(function()
                 pcall(function()
                         Library.KeybindsList.Refresh()
                 end)
+
+                Library.LastLoadReport = report
+                return report
         end
 
         function Library.Unload()
@@ -11607,9 +11697,15 @@ do
                                 end
 
                                 -- Create config: current settings -> <Config name>.cfg
+                                -- v23.12: no double-click confirm anymore (the 0.5s "Are you
+                                -- sure?" window silently cancelled the save whenever the
+                                -- second click was too late - the config was then NEVER
+                                -- written and loading it later restored old settings); the
+                                -- name is stripped of characters Windows cannot have in a
+                                -- file name; a failed writefile now shows an error instead
+                                -- of dying without any message.
                                 Config:Button({
                                         Name = "Create config",
-                                        Confirm = true,
                                         Callback = function()
                                                 local name = Library.Flags["settings_config_name"]
 
@@ -11618,10 +11714,26 @@ do
                                                         return
                                                 end
 
+                                                name = name:gsub('[\\/:*?"<>|]', ""):gsub("^%s*(.-)%s*$", "%1")
+
+                                                if name == "" then
+                                                        Library.Notification("Invalid config name (symbols only)", 4)
+                                                        return
+                                                end
+
                                                 local ConfigFilePath = string.format("%s%s.cfg", ConfigFolder, name)
                                                 local existed = isfile(ConfigFilePath)
 
-                                                writefile(ConfigFilePath, Library.GetConfig())
+                                                local write_ok, write_err = pcall(writefile, ConfigFilePath, Library.GetConfig())
+
+                                                if not write_ok then
+                                                        Library.Notification("Failed to save config: " .. tostring(write_err), 6)
+                                                        return
+                                                end
+
+                                                if Library.LastSaveSkipped and Library.LastSaveSkipped > 0 then
+                                                        Library.Notification(string.format("Saved with %d unreadable setting(s) skipped.", Library.LastSaveSkipped), 5)
+                                                end
 
                                                 if existed then
                                                         Library.Notification(string.format("Overwrote existing config (%s.cfg).", Utility.RichText(name, Library.Theme.accent)), 5)
@@ -11635,9 +11747,13 @@ do
                                 })
 
                                 -- Load config: loads the config selected in the list
+                                -- v23.12: no double-click confirm (one click loads) and the
+                                -- load report is shown: if the file is missing settings this
+                                -- build registers, the .cfg is from an older build - re-save
+                                -- it (Create config, same name) so the missing toggles are
+                                -- actually written into the file.
                                 Config:Button({
                                         Name = "Load config",
-                                        Confirm = true,
                                         Callback = function()
                                                 local name = selected_config()
 
@@ -11649,9 +11765,22 @@ do
                                                 local ConfigFilePath = string.format("%s%s.cfg", ConfigFolder, name)
 
                                                 if isfile(ConfigFilePath) then
-                                                        Library.LoadConfig(readfile(ConfigFilePath))
+                                                        local ok, report = pcall(Library.LoadConfig, readfile(ConfigFilePath))
 
-                                                        Library.Notification(string.format("Successfully loaded config (%s.cfg).", Utility.RichText(name, Library.Theme.accent)), 5)
+                                                        if not ok then
+                                                                Library.Notification("Failed to load config: " .. tostring(report), 6)
+                                                                return
+                                                        end
+
+                                                        Library.Notification(string.format("Loaded config (%s.cfg): %d settings.", Utility.RichText(name, Library.Theme.accent), report.applied), 5)
+
+                                                        if report.errors > 0 then
+                                                                Library.Notification(string.format("Load warnings: %d setting(s) could not be applied.", report.errors), 5)
+                                                        end
+
+                                                        if report.missing > 0 or report.unknown > 0 then
+                                                                Library.Notification(string.format("This config file is outdated (missing %d / unknown %d settings). Turn your settings on and press Create config with this name again to update the file.", report.missing, report.unknown), 8)
+                                                        end
                                                 else
                                                         Library.Notification(string.format("Failed to load config: invalid file (%s.cfg)", Utility.RichText(name, Library.Theme.accent)), 5)
                                                 end
@@ -11673,7 +11802,16 @@ do
                                                 local ConfigFilePath = string.format("%s%s.cfg", ConfigFolder, name)
 
                                                 if isfile(ConfigFilePath) then
-                                                        writefile(ConfigFilePath, Library.GetConfig())
+                                                        local write_ok, write_err = pcall(writefile, ConfigFilePath, Library.GetConfig())
+
+                                                        if not write_ok then
+                                                                Library.Notification("Failed to overwrite config: " .. tostring(write_err), 6)
+                                                                return
+                                                        end
+
+                                                        if Library.LastSaveSkipped and Library.LastSaveSkipped > 0 then
+                                                                Library.Notification(string.format("Saved with %d unreadable setting(s) skipped.", Library.LastSaveSkipped), 5)
+                                                        end
 
                                                         Library.Notification(string.format("Successfully overwrote config (%s.cfg).", Utility.RichText(name, Library.Theme.accent)), 5)
                                                 else
@@ -14524,6 +14662,16 @@ do
         task.spawn(function()
                 task.wait(1)
 
+                -- v23.12: make sure the WHOLE ui - including the late Local-section
+                -- toggles (AntiMine / Auto loot / Remove water nearby) - has registered
+                -- its config flags before the autoload applies a file.
+                -- "no_water_enabled" is the LAST element created in the build, so once
+                -- its flag exists, every other flag exists too.
+                local settle_deadline = os.clock() + 5
+                while Library.ConfigFlags["no_water_enabled"] == nil and os.clock() < settle_deadline do
+                        task.wait(0.1)
+                end
+
                 if not isfile(AutoloadFile) then
                         return
                 end
@@ -14548,7 +14696,7 @@ do
                 end
 
                 local load_ok, load_err = pcall(function()
-                        Library.LoadConfig(readfile(ConfigFilePath))
+                        return Library.LoadConfig(readfile(ConfigFilePath))
                 end)
 
                 if not load_ok then
@@ -14556,7 +14704,11 @@ do
                         return
                 end
 
-                Library.Notification(string.format("Auto loaded config (%s.cfg).", Utility.RichText(name, Library.Theme.accent)), 5)
+                Library.Notification(string.format("Auto loaded config (%s.cfg): %d settings.", Utility.RichText(name, Library.Theme.accent), load_err.applied), 5)
+
+                if load_err.missing > 0 or load_err.unknown > 0 then
+                        Library.Notification(string.format("This config file is outdated (missing %d / unknown %d settings). Re-save it with Create config to update the file.", load_err.missing, load_err.unknown), 8)
+                end
         end)
 end
 

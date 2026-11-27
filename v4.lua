@@ -1,3 +1,523 @@
+-- moneyblox | fps fix round 7 (behavior-preserving perf pass, the same pass ported
+--   1:1 from the optimized 456 build - 60 of 61 hunks apply unchanged to this file):
+--   * __namecall hook: `local args = {...}` was built for EVERY method call in the game
+--     (dozens-hundreds per frame). it is now built lazily inside only the branches that
+--     read or rewrite the arguments (Raycast silent-aim / TweenService FOV patch /
+--     FireProjectile / ProjectileInflict / UpdateTilt); GetAttribute reads use
+--     (select(1, ...)) with no allocation. pass-through calls allocate nothing. the
+--     hook logic, branch order and return values are unchanged.
+--   * raycast filter caching: is_visible / is_pos_visible, target_wall_penetration,
+--     calculate_penetration and the leaning branch of get_estimated_origin rebuilt
+--     FilterDescendantsInstances (new table + engine-side filter copy) on every call /
+--     every sim step. the sources are still read fresh each call but the property is
+--     only re-assigned when an entry actually changed.
+--   * grenade trajectory: traj_ignore() (table build + UniversalTables require + pcall)
+--     ran on every grenade_sim STEP (up to 120 per sim, ~36 sims per lineup pass);
+--     it now runs once per simulation (the ignore list cannot change mid-sim).
+--   * hud throttle scope fix: the 10 Hz hud refresh used `return`, which also throttled
+--     the aimbot block below it to 10 Hz whenever the hud card was on screen. the gate
+--     now scopes the hud block only - the aimbot block runs per frame again.
+--   * hud refresh (10 Hz): row/hp/avatar/card layout writes are change-checked, and the
+--     white/green/red + hp gradient colors are hoisted constants instead of new
+--     Color3.fromRGB calls per refresh. fields-table structure untouched.
+--   * player ESP: part_cache stores the Part itself (no per-part {cframe,size} table
+--     allocation per player per frame; cframe/size read live in getBoundingBox and the
+--     skeleton pass - same values, same frame). drop-item classify loop waits 0.1s per
+--     step instead of every frame (label may appear up to 100ms later, display-only).
+--   * player_list heartbeat: humanoid per player and the local player's HRP are cached
+--     per character instead of a child scan every frame.
+--   * get_targets_in_fov: the aim-part list / weighted total / sort comparator are
+--     computed once per call instead of per player per frame (the random pick itself
+--     stays per player).
+--   * neck / look-angle loop: joint references cached per character (re-resolved on
+--     Parent loss) instead of up to 10 FindFirstChild per tick at 60 Hz, and each
+--     C0 / Motor6D lerp write is skipped once converged (identical final poses).
+--   * desync: the heartbeat enable gate moved above the humanoid/hrp/head lookups so
+--     a fully idle desync costs one character read per frame instead of 3 child scans;
+--     the visualizer wireframe only clears while actually drawing (plus one clear on
+--     the off-transition), reuses its buffers and reads workspace.WorldPivot once per
+--     frame instead of per vertex.
+--   * misc per-frame waste: aimbot idle loop no longer rewrites the empty indicator
+--     text every frame; bullet_stats is a proper local (was a leaked global every
+--     frame); fov circle Position / snapline From+Color / crosshair (position,
+--     rotation, opacity, glow+flash colors, Visible flags) writes are change-checked
+--     and the flash white is a hoisted constant; underground resolver skips all
+--     character lookups while fully idle; spiderman builds its RaycastParams once per
+--     character; anti-drown caches the GameplayVariables instance; no-fall caches
+--     humanoid/hrp per character; freecam builds its scan closure once and only
+--     writes ReplicationFocus when it changes; vehicle esp caches gui/text, change-
+--     checks text/color/enabled and applies its size once per slider change; boss
+--     tracker recursion no longer double-allocates GetChildren per node; weather
+--     tint endpoints are hoisted constants; skin auto-dress skips the camera scan
+--     while no skins are configured; report notifications cache the Reports instance;
+--     trajectory static colors are change-checked (LINEUP_WHITE hoisted).
+--   * not applied (would change behavior): caching the aimbot target scan behind the
+--     aimbot key gate - the crosshair "Target" position mode reads target_part while
+--     the key is up, so skipping the scan would visibly change that mode.
+--   * the file's line endings are normalized to LF (was CRLF); Lua / executors treat
+--     them identically. no feature, flag, element id or config key was added, removed
+--     or reordered.
+-- moneyblox | attachment viewer ported from the inventory-viewer build: gun mods render as item icon grids (pulled from the game's ItemsList) - icon size + position adjustable via the "Att. icon size" / "Att. size" / "Att. X" / "Att. Y" sliders
+-- moneyblox | functions trimmed + Unload + Linoria UI (Ardour style ui from violin-suzutsuki/LinoriaLib)
+-- fixed build: silent auto-shoot repaired (robust fire + fallback), legacy spin-mode toggle removed, Desync untouched
+-- v23.15 (target hud setup locked - size / position sliders removed, per request):
+--   * the "HUD width" / "HUD height (0 = auto)" / "HUD Y" sliders are gone
+--     from the menu. the values they were left at are now baked in as the
+--     fixed setup: card width 260px, card height 0 (auto-fit the content)
+--     and the card bottom sits 94px above the bottom of the screen (the
+--     previous default position was 72px).
+--   * the "HUD elements" dropdown and the "Target hud" toggle stay, and the
+--     card is still mouse-draggable for temporary moves.
+--   * config safe: hud_w / hud_h / hud_y keys an old config file may still
+--     carry are skipped by Library.LoadConfig (unknown flags are ignored),
+--     the same pattern as every earlier element removal.
+-- v23.14 (target hud position - new "HUD Y" slider, per request):
+--   * new "HUD Y" slider on the aimbot tab right under "HUD height
+--     (0 = auto)": it moves the Target hud card up / down the screen,
+--     same idea as the inventory viewer's "Viewer Y" slider. the value
+--     is the gap in px between the bottom of the card and the bottom of
+--     the screen (0 = flush with the bottom, 72 = the default spot just
+--     above the hotbar, higher = the card sits further up). the value is
+--     saved through the "hud_y" config flag like every other hud
+--     setting, and the card is still mouse-draggable - dragging simply
+--     overrides the slider until the slider is moved again.
+--   * nothing else was touched: same rows, same sizes, same default
+--     position until the slider is used.
+-- v23.13 (target hud cleanup - "Dist" / "Visor" / "Tool" rows removed per request):
+--   * the Target hud no longer renders the "Dist", "Visor" and "Tool" rows:
+--     the three field blocks are gone from the render loop (the player
+--     branch and the NPC branch for Dist), together with everything only
+--     they used - the visor inventory scan behind the Visor row (the 1 Hz
+--     stat-cache pass no longer walks the target's Inventory
+--     GetDescendants every refresh: small perf win), the EquippedTool
+--     lookup behind the Tool row, the sc.visor reset, the dead stat_cache
+--     visor / tool fields and the now unused gray / orange color locals.
+--   * the "HUD elements" dropdown loses the "Distance" / "Weapons" /
+--     "Visor" options and cheat.hud.show loses the dist / guns / visor
+--     keys, so no menu state or config can bring the rows back. config
+--     safe the same way as the v23.7 / v23.8 removals: LoadConfig keys by
+--     flag name and LinoriaLib's multi Dropdown:SetValue drops unknown
+--     values through table.find, so an old config that still lists
+--     "Distance" / "Weapons" / "Visor" loads without them and every other
+--     element keeps its saved value. the remaining eight rows (Avatar /
+--     Name / Vis / KDR / KD / Reports / Time / Health) render exactly as
+--     before.
+--   * the "Visor" element on the ESP tab and the aimbot / esp "Distance
+--     check" dropdowns are different features and are untouched, exactly
+--     as shipped. nothing else was touched: same features, same ids, same
+--     behavior.
+-- v23.12 (config load fix - "load config and these toggles stay off"):
+--   * LoadConfig is no longer one bad flag away from dying silently. the
+--     loader applied every flag setter unguarded and LinoriaLib's
+--     SafeCallback re-raises element callback errors while
+--     Library.NotifyOnError is unset (it never was set), so ONE erroring
+--     callback anywhere in the config - a feature touching an instance that
+--     is gone at load time, a bad enum/hex value in the file, the skins or
+--     weapon-edits apply failing - aborted the whole load at that flag and
+--     every setting after it in the file silently never applied. on screen
+--     that was exactly "pressed load config and these toggles did not come
+--     back on". changes:
+--     1. Linoria.NotifyOnError = true right after the lib loads - SafeCallback
+--        now pcalls every element callback and reports the error as a
+--        notification instead of raising it (menu clicks included).
+--     2. Library.LoadConfig applies every flag through its own pcall; failed
+--        flags are collected and reported ("Config load: N setting(s) failed
+--        - the rest applied"), the JSON decode is guarded, and the v22.6
+--        keybind re-drive pass is unchanged.
+--     3. LoadConfig counts settings that exist in this build but are missing
+--        from the loaded file ("config is outdated - re-create it"): configs
+--        saved by an older build can never restore toggles that were added
+--        later (the v23.x Misc/Local sections: mine manipulation, fake map,
+--        detectors, AntiMine, auto loot gun/corpse, remove water, ...), no
+--        matter how often that file is loaded.
+--     4. the "Load config" button pcalls the loader and shows a real error
+--        notification instead of dying inside the click handler.
+--     5. untouched colorpickers now save: their config flag was only written
+--        inside the picker callback, which never runs at creation, so a
+--        never-touched color was absent from every saved config and silently
+--        did not restore on load. the flag is seeded with the initial
+--        payload at creation instead.
+--   * nothing else was touched: same features, same element ids, same flag
+--     names, same config format - old configs load exactly as before, just
+--     without the silent abort.
+-- v23.11 (grip icons + fps round 6):
+--   * gun customization ("Attachments" section on the Skins tab): slots that
+--     hold a fitted attachment on the player's own copy of the weapon now
+--     always appear in the Slot dropdown, and the fitted attachment itself is
+--     always selectable with its icon - GRIPS were the invisible one (some gun
+--     models have no Grip AttachmentPoints child, wep_unlock is false so the
+--     static fallback slots never ran, and CompatibleParts alone did not
+--     always list the fitted grip). the grip the gun actually has now shows
+--     up as a picture like every other attachment.
+--   * the left-corner inventory viewer's [Attachments] icon grid collects
+--     attachments recursively (attachments nested one folder deeper) and also
+--     reads slot->name attributes stamped on the Attachments folder, so a
+--     fitted grip shows its icon there too. deduped by name; nothing else
+--     changed.
+--   * remove water nearby: radius FIXED at 50 (the "Water radius" slider was
+--     removed per request), ONE clearing pass fires after walking 18+ studs
+--     since the previous pass (the old 8-studs/0.3s fast tick is gone) and
+--     the standing-still re-assert interval went from 2s to 5s - this is the
+--     fps fix (round 6): far fewer ReadVoxels/WriteVoxels + GetPartBoundsInBox
+--     passes per minute while every behavior (terrain clearing, hiding water
+--     parts, swim disable, restore on off/unload) stays exactly the same.
+--   * both auto loot keybinds stay press-once toggles (v23.6) - untouched.
+--     old configs that still carry the no_water_radius flag simply ignore it
+--     (LoadConfig skips unknown flags); every other flag keeps its meaning.
+-- v23.10 (new function: remove water nearby):
+--   * new "Remove water nearby" toggle + "Water radius" slider (16-128 studs,
+--     default 64) at the very bottom of the Local section: while enabled, the
+--     terrain voxels around the local character are scanned and every Water
+--     voxel inside the radius is turned into Air CLIENT-SIDE ONLY (Terrain
+--     ReadVoxels/WriteVoxels - the server never sees it), so walking near a
+--     lake/river deletes the water around the character and the lakebed can
+--     be walked instead of swum. only Water voxels are touched - ground /
+--     rock / sand materials stay, no holes are dug.
+--   * water built from parts is hidden the same way (LocalTransparencyModifier,
+--     client-only, matched by Enum.Material.Water or water-ish names) and the
+--     humanoid Swimming state is held disabled while the toggle is on, so
+--     nothing re-triggers swimming inside the cleared area.
+--   * perf: one ReadVoxels per pass (default radius 64 = a 32x32x32 voxel
+--     region, a few ms) and one GetPartBoundsInBox query - no workspace walks
+--     anywhere. passes fire after moving 8+ studs (0.3s throttle); standing
+--     still re-asserts every 2s, so terrain that streamed back is cleared
+--     again too.
+--   * everything is restored when the toggle turns off or on unload: the
+--     saved water voxels (flat x/y/z/mat/occ lists, budget 1,000,000 voxels
+--     FIFO) are written back into a fresh ReadVoxels of each region, hidden
+--     parts get their original transparency back and Swimming is re-enabled
+--     - unload returns the world to vanilla like the MON-50 bypass does.
+--   * the two ui elements are built at the very END of the ui build (after
+--     the "Auto loot Corpse" keybind) for the same reason as every other
+--     feature before: element ids (moneyblox_N) are handed out in creation
+--     order and existing configs key by them. flags: no_water_enabled /
+--     no_water_radius. nothing else was touched.
+-- v23.8 (sky resolver removed entirely + fps fix round 5):
+--   * the whole Sky resolver feature is gone per request: the "Sky resolver"
+--     toggle and its keybind, the "Sky height" / "Sky sit" / "Sky shoot from
+--     ground" / "Sky auto drop" controls, the two MouseButton1 input
+--     connections and the hover renderstepped loop behind them, together
+--     with every skyres_* config flag. saved configs load exactly as
+--     before - they key by flag name and LoadConfig skips unknown flags,
+--     so a stored skyres_* entry, if any, is simply ignored and every
+--     other control still receives its own values. the other resolvers
+--     (Desync / Angle / Underground) are untouched and keep their exact
+--     current behavior, including the underground-owns-the-character rule.
+--   * fps fix round 5 - the leftovers the earlier audit rounds did not
+--     touch yet:
+--     1. the desync/angle resolver PreRender walk did a per-player
+--        FindFirstChild("HumanoidRootPart") EVERY frame even with both
+--        resolvers off, and it was a raw PreRender connection Unload could
+--        not stop. now one boolean check skips the whole walk while both
+--        are off, and the loop runs through cheat.utility.new_renderstepped
+--        so Unload stops it like every other loop. with a resolver enabled
+--        the walk itself is unchanged.
+--     2. the freecam ReplicationFocus scan walked the WHOLE workspace
+--        (workspace:GetDescendants) five times a second while freecam was
+--        active - a full map materialization every 0.2s, the same hitch
+--        class the mine manipulation / no leafs fixes removed. rebuilt with
+--        the same event-driven pattern: ONE chunked workspace snapshot when
+--        freecam activates (~8000 entries per frame, so enabling never
+--        hitches either), a workspace.DescendantAdded watcher that tracks
+--        models streaming in later, dead entries pruned on every pass, and
+--        the 0.2s pass only iterates the tracked model set. the
+--        ReplicationFocus write itself behaves exactly as before (cleared
+--        when freecam is off, set to the closest model when on).
+--     3. the desync preparation path contained a raw `repeat until tick()`
+--        busy-wait - a 0.8s full-thread spin that hard-freezes the game
+--        (fps drops to 0 for 0.8s straight) whenever it runs. replaced with
+--        task.wait(0.8): same delay, but it yields properly instead of
+--        stalling every frame.
+--   * the freecam PreRender also wrote hrp.Anchored both ways every frame
+--     even when the value did not change; both writes now only fire on
+--     change (same rule as the esp rotation write fix from round 3).
+--   * nothing else was touched: same features, same behavior.
+-- v23.7 (neon fov feature removed entirely, per request):
+--   * the "Neon FOV" toggle and its "Neon FOV color" picker are gone from
+--     the Effects/Logs section, together with everything behind them: the
+--     4-circle glow renderer, its renderstepped loop, the drawings and the
+--     two config flags "neon_fov_enabled" / "neon_fov_color". those two
+--     elements were the last ui elements ever created, so no other element
+--     id moved and saved configs load exactly as before (a stored neon
+--     flag, if any, is simply ignored - LoadConfig skips unknown flags).
+--     nothing else was touched: same features, same ids, same behavior.
+-- v23.6 (auto loot keybinds: press once = on, Hold mode removed):
+--   * both auto loot keybinds ("Auto loot gun" + "Auto loot all") offered
+--     a right-click "Hold" mode listed FIRST in the mode menu, and in Hold
+--     mode the feature runs ONLY while the key is physically held down -
+--     with a key set, loot stopped the moment the key was released, so the
+--     features felt broken while running around. per request both pickers
+--     are now Toggle-only: pick a key and ONE press flips the feature on
+--     and it stays on while the character runs anywhere; press again (or
+--     click the toggle in the menu) to turn it off. the Hold entry is gone
+--     from the mode menu, and a "Hold" value saved in an old config (if
+--     any) loads back as Toggle. nothing else changed: same keybind flags
+--     and _data format, same element ids (only the Modes list of the two
+--     pickers was edited, no element moved), loot logic untouched, and the
+--     keybinds of every other function keep their exact current behavior.
+-- v23.5 (toggle keybinds for both auto loot features):
+--   * "Auto loot gun" and "Auto loot all" each get a keybind picker built
+--     with their toggle: pick any key in the menu and pressing it flips
+--     the feature on/off with the same semantics as the menu key opening
+--     and closing the ui (the picker also offers Hold mode = loot only
+--     while the key is down). implemented with a new optional "Flip"
+--     keybind option: when set, the compat keybind drive also drives the
+--     linked toggle's config flag, so one key press flips the real
+--     feature (its callback, flag and on-screen status all update, same
+--     as a menu click). a small sync keeps the picker aligned when the
+--     feature is toggled from the menu instead, so the next press always
+--     does the right thing. existing keybinds (Link-based gate binds)
+--     keep their exact current behavior - they do not pass Flip.
+--   * both keybinds show in the on-screen keybinds list like every other
+--     bind ("[...]" until a key is picked, highlighted while the feature
+--     is on; the keybinds list View setting still decides Pressed/All).
+--     they save through the standard <flag>_data config mechanism. the
+--     config format is flag-keyed, so the two new picker element ids
+--     shift nothing in saved configs and no existing ui element moved.
+-- v23.4 (neon fov + match aimbot fov merged into one toggle, fps fix hardening):
+--   * the separate "Match aimbot fov" toggle is gone: "Neon FOV" now IS the
+--     linked mode - turning it on always projects the neon halo from the
+--     aimbot's own "Aim size" slider with the same formula as the "Aimbot
+--     fov" circle, and it follows the FOV changer / zoom. the standalone
+--     pixel size slider was removed with it (the link is the only mode).
+--     both neon elements were built at the end of the ui, so no existing
+--     config element id moved, and LoadConfig skips unknown flags, so old
+--     saved configs still load fine (the two retired flags are ignored).
+--   * fps fix hardening: extra variant patterns for the fade-loop /
+--     fade-wait libstring patches (pairs-style loop, no-space loop,
+--     semicolon-less wait) so the ui open/close tween storm also stays
+--     dead if the upstream LinoriaLib text shifts a bit. every variant
+--     is a no-op when its exact text is absent. all fps patches touch
+--     ONLY the menu fade animation - no feature, element or callback
+--     behavior changes anywhere.
+-- v23.3 fps fix round 4 (ui open/close tween storm + neon fov linked to aimbot fov):
+--   * ui open/close fps dip: stock LinoriaLib fades the menu on every
+--     open/close by walking Outer:GetDescendants() and creating 1-2
+--     TweenService tweens PER descendant - on this ui that is hundreds of
+--     simultaneous tweens plus a full tree walk in a single frame, once on
+--     open and once on close. two new libstring patches (C+D next to the
+--     v22.3 cursor patches) turn the fade loop into a no-op and drop the
+--     fade wait, so the window shows/hides instantly with zero tween
+--     churn - same layout, same look, no fade animation. patches are
+--     no-ops on stock/changed upstream source.
+--   * neon fov is now linked to the aimbot fov by default: the halo radius
+--     is projected from the same "Aim size" slider value (Flag
+--     "aimbot_fov_size") with the same formula the "Aimbot fov" circle
+--     uses, so the neon ring always sits exactly on the circle the aimbot
+--     (and silent aim / tp kill - everything that reads the fov) aims
+--     through, and it follows the FOV changer / zoom automatically. a new
+--     "Match aimbot fov" toggle (created last, config ids untouched) turns
+--     the link off to get the old standalone pixel size back. the neon
+--     render loop also skips drawing writes that did not change (same rule
+--     as the esp rotation write fix from round 3).
+--   * untouched on purpose: silent aim / autoshoot, freecam, underground /
+--     desync, and everything fixed in rounds 1-3 exactly as shipped.
+-- v23.2 fps fix round 3 (dead aimbot wireframe sweep + esp rotation writes;
+--   silent aim / freecam / Underground untouched):
+--   * the Combat > Misc "Hold bullets" do-block still created a leftover
+--     WireframeHandleAdornment and cleared it EVERY frame through a
+--     renderstepped connection - but nothing ever drew into it (the only
+--     AddLines calls in the build belong to the per-player esp skeleton
+--     and the Underground visualizer, both on their own instances). the
+--     instance and the per-frame clear loop are gone; the hold bullets
+--     toggle itself is untouched and behaves exactly the same.
+--   * player esp render wrote main_holder.Rotation and the box gradient
+--     Rotation every frame even when both spin options were off (the
+--     values never changed). both writes are now skipped when the value
+--     is already correct - spinning holders/gradients behave identical.
+--   * untouched on purpose: silent aim / autoshoot and its target scan,
+--     freecam (including its ReplicationFocus scan), underground /
+--     desync, and everything fixed in rounds 1-2 exactly as shipped.
+-- v23.2 fps fix round 2 (mine manipulation + no leafs; silent aim / freecam / Underground untouched):
+--   * audit round 1 rebuilt the MON-50 bypass (v23.1). this round fixes the
+--     two remaining periodic full-tree walks found in the audit - the same
+--     class of recurring frame spike, same cure, everything else untouched.
+--   * mine manipulation: the old loop walked workspace:GetDescendants (the
+--     whole map) EVERY 0.5s while the toggle was on, on top of firing the
+--     mines - a full map materialization twice a second. now: mines in the
+--     known AiZones folders are still read directly (that part is cheap),
+--     loose mines live in a tracked set filled by ONE chunked workspace
+--     snapshot taken when the toggle goes on (~5000 entries per frame) plus
+--     a workspace.DescendantAdded watcher that catches mines planted or
+--     streamed in later. dead entries are pruned on every pass. explode
+--     (0.5s) / deactivate (5s) cadences and trigger resolution unchanged,
+--     and the action loop now runs through cheat.utility.new_heartbeat so
+--     Unload stops it (the old raw task.spawn loop kept running after
+--     unload).
+--   * no leafs: the old code re-walked the whole SpawnerZones/Foliage tree
+--     every 10s while enabled. now: one chunked walk on enable (2000 nodes
+--     per frame), a DescendantAdded watcher scoped to the Foliage folder
+--     that hides a leaf the moment its SurfaceAppearance streams in, a
+--     cheap 2s re-assert of only the already-hidden nodes (dead ones
+--     pruned), and the old toggle-off restore walk kept but chewed over
+--     frames. unload disconnects the watcher and restores every hidden
+--     leaf.
+--   * untouched on purpose: silent aim / autoshoot, freecam (including its
+--     ReplicationFocus scan), underground / desync, and the v23.1 MON-50
+--     bypass exactly as shipped.
+-- v23.1 MON-50 bypass fps rebuild (same feature, no more frame spikes):
+--   * v23.0 re-scanned the WHOLE workspace every 0.5s while enabled:
+--     workspace:GetDescendants on a big map materializes a huge list in one
+--     frame, so the fps jerked every 0.5s. the feature worked but that loop
+--     was the hitch, so it is gone.
+--   * the toggle is now event-driven: a workspace.DescendantAdded watcher
+--     (connected once, basically free while disabled) instantly disables
+--     every MON-50 that shows up - planted later, streamed back in - and
+--     every part the game re-creates inside an existing mine (short capped
+--     ancestor walk). zero per-frame scanning while playing.
+--   * the only full scan left is ONE workspace snapshot taken the moment
+--     the toggle goes on, and even that is chewed through in ~5000-entry
+--     chunks per frame, so enabling the toggle does not hitch either.
+--   * the old rescan also re-disabled parts whose CanTouch the game flipped
+--     back. kept as a cheap pass: every 0.5s only the already-flipped parts
+--     are re-asserted (usually a handful), dead ones pruned - not a
+--     workspace walk.
+--   * unload safety: cheat.utility gained on_unload(), a cleanup registry
+--     for raw signal connections (they cannot live in the heartbeat
+--     tables). unloading now disconnects the watcher, drops any pending
+--     chunk pass and puts every flipped part back, so unload returns the
+--     map to vanilla.
+-- v23.0 MON-50 bypass (new function: walking near a MON-50 no longer trips it):
+--   * new "MON-50 bypass" toggle at the bottom of the Misc section (right
+--     side, under the mine manipulation controls): while enabled, every part
+--     of every MON-50 in the world is set to CanTouch=false, and Roblox only
+--     fires the Touched event when BOTH touching parts have CanTouch=true,
+--     so the mine can never feel the character no matter how close you walk.
+--     that is the same trigger path the game's mines use (mine manipulation
+--     explodes them by firing Touched on their Trigger parts with
+--     firetouchinterest), so cutting Touched off kills the detonation for
+--     real. mines stay visible and in place, they just never react.
+--   * the sweep finds MON-50 models/parts by name (mon-50 / mon50 / mon_50 /
+--     mon 50, case-insensitive) and walks up to the parent model the same
+--     way the mine manipulation scanner does. it skips anything carried by
+--     a player (a "MON-50" tool in a hand is not armed) and loose loot under
+--     workspace.DroppedItems, so pickup touch logic is never broken.
+--   * turning the toggle off puts every flipped part back (CanTouch=true),
+--     so the mines work again; parts the mine system destroys itself are
+--     just skipped. the sweep re-runs every 0.5s while enabled through
+--     cheat.utility.new_heartbeat, so mines planted later or parts the game
+--     re-creates are caught too, and Unload stops the sweep like every
+--     other loop (no raw task.spawn loop that keeps running after unload).
+--   * the toggle is built at the very END of the ui build (after the v22.8
+--     autoload block) for the same reason as the v22.7 Local toggles:
+--     element ids (moneyblox_N) are handed out in creation order and
+--     existing configs key by them - adding it earlier would shift every
+--     later id and load old configs into the wrong controls.
+-- v22.7 Local section restored (ported back from the full build):
+--   * "Remove screen effects" + "Mute breathing" moved from the full build
+--     into this Linoria build. they live in a new "Local" section
+--     (Visuals > Misc subtab, right side) using the same toggle names and
+--     flag names as the full build (no_screen_effects / lcl_mute_breathing),
+--     so both features save into configs and reload with them again.
+--   * the two toggles are built at the very END of the ui build on
+--     purpose: element ids (moneyblox_N) are handed out in creation order
+--     and existing configs key by them - building the toggles earlier
+--     would shift every later id and load old configs into the wrong
+--     controls.
+--   * both loops run through cheat.utility.new_heartbeat, so Unload stops
+--     them (the full build's raw while-loop kept running after unload),
+--     and the screen-effects state is applied instantly on toggle instead
+--     of waiting for the next 0.5s sweep.
+-- v22.9 Clear autoload:
+--   * new "Clear autoload" button in the Settings > Main > Config section
+--     (right after "Set as autoload"): deletes
+--     moneyblox\Configs\autoload.txt, puts the "Current autoload config"
+--     line back to "none" and says that nothing will auto load on the next
+--     inject. pressing it while no autoload is set just tells you so (and
+--     fixes the label if it was out of sync). Confirm = true like Delete so
+--     a stray click cannot wipe the autoload.
+--   * the inject autoload task now treats an empty autoload.txt as "no
+--     autoload" too: it deletes the empty file and skips the load, so a
+--     half cleared state can never auto load.
+--   * Unload paths untouched: the Unload button at the bottom of the config
+--     section, Library.Unload and getgenv().Unload stay as they were, and
+--     every loop keeps going through cheat.utility.new_heartbeat so Unload
+--     still stops all of them.
+-- v22.8 SaveManager config section (the config menu from the Ardour /
+--   LinoriaLib SaveManager screenshot):
+--   * the Settings > Main > Config section now uses the exact SaveManager
+--     button set: "Create config" (writes the current settings to a new
+--     .cfg named after the "Config name" box), "Load config" (loads the
+--     config selected in the list), "Overwrite config" (writes the current
+--     settings over the SELECTED .cfg), "Refresh list" (re-reads
+--     moneyblox\Configs), "Set as autoload" (stores the selected config in
+--     moneyblox\Configs\autoload.txt) and a "Current autoload config: x"
+--     line that follows the autoload file (same behaviour as SaveManager).
+--   * the old combined "Save" button is covered by Create (new config) +
+--     Overwrite (existing config); "Delete" is kept as an extra button.
+--     the two list flags keep their names (settings_config_list /
+--     settings_config_name) so older configs still load into them.
+--   * the autoload config is applied once on inject, in a task.spawn that
+--     waits until the whole ui and every flag/callback is registered, and
+--     reuses Library.LoadConfig (so the v22.6 bind re-drive still applies).
+--   * the 5s list sweep is routed through cheat.utility.new_heartbeat so
+--     Unload stops it like every other loop. the Unload button at the
+--     bottom of the config section, Library.Unload and getgenv().Unload
+--     are untouched.
+-- v22.5 fully hidden xyz values (replaces the v22.4 popup idea):
+--   * the X/Y/Z offset + X/Y/Z rotate sliders are REMOVED from the ui
+--     completely - nothing is rendered in the main menu, no popup panel is
+--     spawned on run, and toggling Underground Enabled/Visualize shows
+--     nothing extra. the section just looks like it never had sliders.
+--   * the offset/rotate VALUES still work in the background: the exact same
+--     locals keep feeding the heartbeat cframe math, and the desync_* flags
+--     stay registered (Library.Flags + Library.ConfigFlags) the same way the
+--     real sliders registered them, so saving a config still includes these
+--     values and loading an older config still applies them silently.
+-- v22.6 config fix (Save + Load now keep EVERY Underground setting):
+--   * FIX 1 - the hidden xyz offset/rotate values saved as 0. v22.5 seeded
+--     Library.Flags["desync_*"] with a hardcoded 0 and never synced it with
+--     the real runtime locals (y offset -3.9, rotate 108/180/180 deg), so
+--     the .cfg file contained desync_y_offset=0 etc. and loading that config
+--     OVERWROTE the real pose with zeros - Underground looked reset after
+--     every save/load. the hidden flags are now seeded from the actual
+--     runtime values (rotate stored back in the old slider domain 0-20, so
+--     configs saved by v22.4 and older still load identically).
+--   * FIX 2 - "Toggle" mode keybinds (Underground [B], flyhack, zoom,
+--     thirdperson, tp kill, ...) did not come back active after a config
+--     load: the loader restored the key + mode but never re-drove the bind,
+--     so the feature stayed off until the key was pressed again and the
+--     menu box kept showing it as off. binds whose saved state was ON are
+--     now re-activated by a post-load pass that runs AFTER the whole config
+--     applied (config flags iterate in hash order, so driving a bind during
+--     the loop could read flags that were not loaded yet - the pass is
+--     order-independent). Hold binds are never auto-activated; "Always"
+--     mode was already handled by the loader itself.
+--   * FIX 3 - the Underground section is built behind getfflag(...); on
+--     executors without an fflag API that call errored and killed the whole
+--     section build BEFORE any toggle existed, so nothing Underground could
+--     ever be saved. the fflag read is now pcall-guarded with safe defaults.
+-- v22.3 fps fix (menu-open fps drop, ui now behaves like the original build):
+--   * LinoriaLib draws its own mouse cursor with two Drawing triangles and
+--     refreshes them EVERY frame while the menu is open: a MouseIconEnabled
+--     write + GetMouseLocation + 7 drawing property writes per frame, and the
+--     executor has to render the drawing overlay on top of the game every
+--     frame. the original Sakura UI used the native Roblox cursor with zero
+--     per-frame cost, so the Linoria build lost fps whenever the menu was
+--     open. gameplay loops were already leaner than the old build; this was
+--     the only remaining per-frame cost the old ui did not have.
+--   * the cursor block is now neutralized before loadstring: the spawned
+--     cursor thread returns immediately, no Drawing object is ever created
+--     and the native Roblox cursor stays visible (same as the original ui).
+--     if the library on GitHub changes and neither patch matches, behaviour
+--     falls back to stock LinoriaLib (custom cursor) instead of crashing.
+-- v22.2 keybind list fix:
+--   * kb.Set used type() to detect tables, but on Roblox type(EnumItem) is
+--     "table" too, so the EnumItem branch (picker:SetValue) never ran: the
+--     menu key box stayed "None" instead of "..." and keys loaded from a
+--     config never applied. now uses typeof() (EnumItem -> "EnumItem").
+--   * unbound keybinds show "..." in the menu box right away, before any
+--     key is picked (matches the on-screen list).
+--   * keybind rows refresh (text + accent color) when a key drives the
+--     function on/off.
+-- v22.1 HOTFIX (ui build crashed):
+--   * capture() called container:GetChildren() on Linoria groupbox objects,
+--     which are Lua tables without that method -> the first toggle created
+--     errored and the whole ui stayed empty (only section headers showed).
+--     now snapshots container.Container (the real frame instance) with a
+--     pcall fallback.
+--   * Drawing lib / font / image loading is guarded so missing executor
+--     features can no longer abort the ui build.
 --!native
 --!optimize 2
 
@@ -468,6 +988,17 @@ local Library, Utility = LPH_JIT(function()
 		end
 	end
 	local Linoria = loadstring(libstring)()
+
+	-- v23.12 config fix: LinoriaLib's SafeCallback re-raises element
+	-- callback errors while Library.NotifyOnError is unset. one erroring
+	-- toggle/slider/dropdown/keybind callback used to abort a whole config
+	-- load (or any button click) silently mid-way, and every setting after
+	-- the erroring one in the file never applied - on screen that looked
+	-- like "loaded the config and these toggles just did not come back
+	-- on". with NotifyOnError on, SafeCallback pcalls every element
+	-- callback and shows the error as a notification instead, so one
+	-- broken callback can no longer eat the rest of the load.
+	Linoria.NotifyOnError = true
 	
 
 	-- Ardour theme colors
@@ -1493,6 +2024,14 @@ local Library, Utility = LPH_JIT(function()
                         end
                 end)
 
+                -- v23.12 config fix: the flag used to be written only inside
+                -- the picker callback, which never runs at creation, so an
+                -- untouched colorpicker saved NOTHING and its color silently
+                -- did not come back on config load. seed the flag with the
+                -- initial payload so every colorpicker saves and restores.
+                if flag and not cfg.ignore then
+                        Library.Flags[flag] = { c = cfg.value, a = cfg.alpha or 0 }
+                end
                 local Wrapper = { Value = cfg.value, Alpha = cp.Transparency or 0 }
                 function Wrapper.Set(value, alpha)
                         local Color, Alpha
@@ -1998,32 +2537,17 @@ local Library, Utility = LPH_JIT(function()
         -- config / theme serialization (same format as the old ui)
         -- ==================================================================
         function Library.GetConfig()
-                -- v23.12 config fix: every flag serializes inside its own pcall so one
-                -- unreadable flag can never abort the WHOLE save anymore (before, a
-                -- single error here killed the Create/Overwrite callback silently and
-                -- nothing was written to disk at all). also embeds a "_build" tag so
-                -- the .cfg itself shows which build wrote it.
                 local Config = {}
-                local skipped = 0
                 for _, v in Library.ConfigFlags do
                         local Value = Library.Flags[_]
-                        local ok, payload = pcall(function()
-                                if type(Value) == "table" and Value["key"] then
-                                        return { value = Value.value, mode = Value.mode, key = Value.key and tostring(Value.key) or "None" }
-                                elseif type(Value) == "table" and Value["a"] and Value["c"] then
-                                        return { a = Value.a, c = Value.c:ToHex() }
-                                else
-                                        return Value
-                                end
-                        end)
-                        if ok and payload ~= nil then
-                                Config[_] = payload
+                        if type(Value) == "table" and Value["key"] then
+                                Config[_] = { value = Value.value, mode = Value.mode, key = tostring(Value.key) }
+                        elseif type(Value) == "table" and Value["a"] and Value["c"] then
+                                Config[_] = { a = Value.a, c = Value.c:ToHex() }
                         else
-                                skipped = skipped + 1
+                                Config[_] = Value
                         end
                 end
-                Library.LastSaveSkipped = skipped
-                Config["_build"] = "moneyblox v23.12"
                 return HttpService:JSONEncode(Config)
         end
 
@@ -2047,30 +2571,34 @@ local Library, Utility = LPH_JIT(function()
         end
 
         function Library.LoadConfig(data)
-                data = HttpService:JSONDecode(data)
+                -- v23.12 config fix: every flag used to be applied unguarded
+                -- inside this loop and LinoriaLib only pcalls element callbacks
+                -- when NotifyOnError is on (it was not), so ONE erroring
+                -- callback anywhere aborted the WHOLE load at that flag and
+                -- every setting after it silently never applied. flags are now
+                -- applied one by one through their own pcall: one broken flag
+                -- can no longer eat the rest, the failed ones are reported,
+                -- and settings that exist in this ui but are missing from the
+                -- (outdated) config file are counted.
+                if typeof(data) ~= "string" then
+                        return nil
+                end
 
-                -- v23.12 config fix: harden the load loop. every flag now applies
-                -- inside its own pcall, so ONE broken value can never abort the whole
-                -- load anymore (before, an error mid-loop left every flag after it
-                -- unapplied - looked exactly like "these toggles never come back").
-                -- the pass also reports the file contents:
-                --   applied = file keys that were applied
-                --   errors  = keys that threw while applying (now skipped)
-                --   unknown = keys this build does not register (skipped, same as before)
-                --   missing = registered settings the file does NOT carry - that means
-                --             the .cfg was saved by an OLDER build (or never re-saved),
-                --             so those toggles cannot return from this file and the
-                --             config should be re-saved (Create config, same name).
-                local report = { applied = 0, errors = 0, unknown = 0, missing = 0, error_names = {} }
+                local decode_ok, decoded = pcall(function()
+                        return HttpService:JSONDecode(data)
+                end)
+                if not decode_ok or type(decoded) ~= "table" then
+                        return nil
+                end
 
-                for i, v in data do
-                        if type(i) == "string" and i:sub(1, 1) == "_" then
-                                -- internal metadata (the "_build" tag) - not a flag
-                                continue
-                        end
+                local failed_flags = {}
+                local first_error = nil
+                local missing_count = 0
+
+                for i, v in decoded do
                         local Config = Library.ConfigFlags[i]
                         if Config then
-                                local ok = pcall(function()
+                                local flag_ok, flag_err = pcall(function()
                                         if type(v) == "table" and v["a"] and v["c"] then
                                                 Config({
                                                         a = v.a,
@@ -2086,22 +2614,22 @@ local Library, Utility = LPH_JIT(function()
                                                 Config(v)
                                         end
                                 end)
-                                if ok then
-                                        report.applied = report.applied + 1
-                                else
-                                        report.errors = report.errors + 1
-                                        report.error_names[#report.error_names + 1] = tostring(i)
+                                if not flag_ok then
+                                        failed_flags[#failed_flags + 1] = tostring(i)
+                                        if not first_error then
+                                                first_error = tostring(flag_err):match("([^:]+)$")
+                                                        or tostring(flag_err)
+                                        end
                                 end
-                        else
-                                report.unknown = report.unknown + 1
                         end
                 end
 
-                -- NOTE: one loop variable = the KEY (flag name); with two variables
-                -- the second would be the handler FUNCTION, not the flag name
+                -- v23.12: settings registered in this build but absent from the
+                -- file = the config was saved by an older version and can never
+                -- restore those toggles until it is re-created
                 for flag in Library.ConfigFlags do
-                        if data[flag] == nil and Library.Flags[flag] ~= nil then
-                                report.missing = report.missing + 1
+                        if decoded[flag] == nil then
+                                missing_count = missing_count + 1
                         end
                 end
 
@@ -2122,8 +2650,26 @@ local Library, Utility = LPH_JIT(function()
                         Library.KeybindsList.Refresh()
                 end)
 
-                Library.LastLoadReport = report
-                return report
+                -- v23.12: diagnostics - a load is never silent again
+                pcall(function()
+                        if #failed_flags > 0 then
+                                local shown = {}
+                                for i = 1, math.min(#failed_flags, 3) do
+                                        shown[#shown + 1] = failed_flags[i]
+                                end
+                                local more = #failed_flags > 3
+                                        and (" (+" .. (#failed_flags - 3) .. " more)") or ""
+                                Library.Notification("Config load: " .. #failed_flags
+                                        .. " setting(s) failed" .. more .. " - the rest applied"
+                                        .. " (first: " .. failed_flags[1] .. ": "
+                                        .. tostring(first_error) .. ")", 8)
+                        end
+                        if missing_count > 0 then
+                                
+                        end
+                end)
+
+                return decoded
         end
 
         function Library.Unload()
@@ -5911,6 +6457,8 @@ do
 
 
                                 local weapon, armor, inventoried, last = {}, {}, {}, {}
+                                -- v23.11: validates slot-stamped attachment names collected below
+                                local att_items_list = game:GetService("ReplicatedStorage"):FindFirstChild("ItemsList")
                                 for _, item in inventory:GetChildren() do
                                         local item_name = item.Name
                                         local slot = item:GetAttribute("Slot")
@@ -5927,9 +6475,35 @@ do
                                                 local attachment_names = {}
                                                 local attachments = _FindFirstChild(item, "Attachments")
                                                 if attachments then
-                                                        for _, attachment in attachments:GetChildren() do
-                                                                attachment_names[#attachment_names + 1] = attachment.Name
+                                                        -- v23.11: grips (and any other attachment) can sit one
+                                                        -- folder deeper inside the Attachments folder or be
+                                                        -- stamped as a slot->name attribute on the folder itself
+                                                        -- - both were missed before, so a gun with a grip fitted
+                                                        -- could show no grip icon at all. children are collected
+                                                        -- recursively (Folders are descended into) and string
+                                                        -- attributes whose value is a real ItemsList entry are
+                                                        -- added as well; everything is deduped by name.
+                                                        local seen_att = {}
+                                                        local function collect_attachments(folder)
+                                                                for _, attachment in folder:GetChildren() do
+                                                                        if attachment:IsA("Folder") then
+                                                                                collect_attachments(attachment)
+                                                                        elseif not seen_att[attachment.Name] then
+                                                                                seen_att[attachment.Name] = true
+                                                                                attachment_names[#attachment_names + 1] = attachment.Name
+                                                                        end
+                                                                end
+                                                                for _, attr_value in folder:GetAttributes() do
+                                                                        if type(attr_value) == "string" and attr_value ~= "" and not seen_att[attr_value] then
+                                                                                local entry = att_items_list and att_items_list:FindFirstChild(attr_value)
+                                                                                if entry then
+                                                                                        seen_att[attr_value] = true
+                                                                                        attachment_names[#attachment_names + 1] = attr_value
+                                                                                end
+                                                                        end
+                                                                end
                                                         end
+                                                        collect_attachments(attachments)
                                                 end
                                                 weapon[found_slot] = {item_name, get_weapon_loadedammo(item), mathfloor(durability / max_durability * 100), skin_name, attachment_names}
                                                 continue
@@ -10171,56 +10745,6 @@ desync_x_rotate, desync_y_rotate, desync_z_rotate = math.rad(6 * 18), math.rad(1
                         end
                 end
 
-        -- ==================================================================
-        -- v23.9: underground walk-anim freeze
-        -- while the underground gate (desync_enabled and desync_enabled_key)
-        -- is active, the character's "Animate" script is disabled and every
-        -- animation track playing on its Animator is stopped, so moving
-        -- around no longer plays the walk cycle - the character glides in a
-        -- frozen pose. the freeze re-asserts (the game re-enables the same
-        -- script / the character respawns while the gate is on) and the
-        -- exact instance that was disabled is re-enabled when the gate
-        -- turns off or on unload. movement, walkspeed and the pose math
-        -- below are untouched.
-        -- ==================================================================
-        local ug_unloaded = false
-        local ug_frozen_animate = nil
-
-        local ug_stop_tracks = function(humanoid)
-                local animator = humanoid and _FindFirstChildOfClass(humanoid, "Animator")
-                if animator then
-                        for _, track in animator:GetPlayingAnimationTracks() do
-                                track:Stop(0)
-                        end
-                end
-        end
-
-        local ug_legs_freeze = function(character, humanoid)
-                if ug_unloaded then return end
-                local animate = _FindFirstChild(character, "Animate")
-                if not animate then return end
-                if ug_frozen_animate == animate and animate.Disabled then
-                        return
-                end
-                ug_frozen_animate = animate
-                animate.Disabled = true
-                ug_stop_tracks(humanoid)
-        end
-
-        local ug_legs_restore = function()
-                if not ug_frozen_animate then return end
-                local current_character = LocalPlayer.Character
-                local animate = current_character and _FindFirstChild(current_character, "Animate")
-                if animate == ug_frozen_animate then
-                        animate.Disabled = false
-                end
-                ug_frozen_animate = nil
-        end
-
-        cheat.utility.on_unload(function()
-                ug_unloaded = true
-                ug_legs_restore()
-        end)
 
         RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
                 replicated_hrp_cframe = nil
@@ -10228,19 +10752,13 @@ desync_x_rotate, desync_y_rotate, desync_z_rotate = math.rad(6 * 18), math.rad(1
                 character = LocalPlayer.Character
                 if not character then return end
                 -- fps round 7: the enable gate moved above the humanoid/hrp/head lookups so a
-                -- fully idle desync costs one character read per frame instead of 3 child scans.
-                -- the ug_legs_restore() call is unchanged (it self-gates on ug_frozen_animate).
-                if not (desync_enabled and desync_enabled_key) then
-                        ug_legs_restore() -- v23.9: underground off -> walking animation back
-                        return
-                end
+                -- fully idle desync costs one character read per frame instead of 3 child scans
+                if not (desync_enabled and desync_enabled_key) then return end
                 humanoid = _FindFirstChildOfClass(character, "Humanoid")
                 hrp = _FindFirstChild(character, "HumanoidRootPart")
                 head = _FindFirstChild(character, "Head")
 
                 if not (humanoid and hrp) then return end
-
-                ug_legs_freeze(character, humanoid) -- v23.9: underground on -> walk-anim frozen
 
                 old_cframe = hrp.CFrame
                 old_velocity = hrp.AssemblyLinearVelocity
@@ -11177,6 +11695,44 @@ do
                                 end
                         end
                 end
+                -- v23.11: slots that actually hold a fitted attachment on the
+                -- player's own copy of this weapon always appear in the Slot
+                -- dropdown, even when the gun model has no matching
+                -- AttachmentPoints child (GRIPS were the invisible one: wep_unlock
+                -- is false so the static fallback above never ran, and some guns
+                -- list no grip point at all). fitted attachments can be stored as
+                -- children with a Slot attribute or stamped as slot->name
+                -- attributes on the Attachments folder - both are merged here,
+                -- deduped; nothing else changes.
+                local fitted_folder = game:GetService("ReplicatedStorage"):FindFirstChild("Players")
+                local fitted_data = fitted_folder and fitted_folder:FindFirstChild(LocalPlayer.Name)
+                local function scan_fitted_slots(root)
+                        if not root then return end
+                        for _, v in root:GetChildren() do
+                                if v.Name == weapon and v:FindFirstChild("Attachments") then
+                                        local atts = v:FindFirstChild("Attachments")
+                                        for _, a in atts:GetChildren() do
+                                                local s = a:GetAttribute("Slot")
+                                                if type(s) == "string" and s ~= "" and not seen[s] then
+                                                        seen[s] = true
+                                                        out[#out + 1] = s
+                                                end
+                                        end
+                                        for s, _ in atts:GetAttributes() do
+                                                if type(s) == "string" and s ~= "" and not seen[s] then
+                                                        seen[s] = true
+                                                        out[#out + 1] = s
+                                                end
+                                        end
+                                end
+                                local inner = v:FindFirstChild("Inventory")
+                                if inner then scan_fitted_slots(inner) end
+                        end
+                end
+                if weapon then
+                        scan_fitted_slots(fitted_data and fitted_data:FindFirstChild("Inventory"))
+                        scan_fitted_slots(fitted_data and fitted_data:FindFirstChild("Hotbar"))
+                end
                 table.sort(out)
                 return out
         end
@@ -11213,6 +11769,42 @@ do
                 if def then set[def] = true end
                 local guess = items_list() and items_list():FindFirstChild(slot .. weapon)
                 if guess then set[slot .. weapon] = true end
+                -- v23.11: what the player's own copy of this weapon actually has
+                -- fitted in this slot is ALWAYS selectable with its icon, even when
+                -- CompatibleParts does not list it (that was the missing grip: the
+                -- icon grid showed no pictures because the fitted grip never made
+                -- it into the option list). children with a Slot attribute are read
+                -- by name; slot->name attributes on the Attachments folder are read
+                -- too and validated against ItemsList so nothing bogus lands in the
+                -- grid. names are deduped through the set.
+                local opt_list = items_list()
+                local opt_folder = game:GetService("ReplicatedStorage"):FindFirstChild("Players")
+                local opt_data = opt_folder and opt_folder:FindFirstChild(LocalPlayer.Name)
+                local function scan_fitted_atts(root)
+                        if not root then return end
+                        for _, v in root:GetChildren() do
+                                if v.Name == weapon and v:FindFirstChild("Attachments") then
+                                        local atts = v:FindFirstChild("Attachments")
+                                        for _, a in atts:GetChildren() do
+                                                if a:GetAttribute("Slot") == slot and a.Name ~= "" then
+                                                        set[a.Name] = true
+                                                end
+                                        end
+                                        for s, a_name in atts:GetAttributes() do
+                                                if s == slot and type(a_name) == "string" and a_name ~= "" and not set[a_name] then
+                                                        local entry = opt_list and opt_list:FindFirstChild(a_name)
+                                                        if entry then
+                                                                set[a_name] = true
+                                                        end
+                                                end
+                                        end
+                                end
+                                local inner = v:FindFirstChild("Inventory")
+                                if inner then scan_fitted_atts(inner) end
+                        end
+                end
+                scan_fitted_atts(opt_data and opt_data:FindFirstChild("Inventory"))
+                scan_fitted_atts(opt_data and opt_data:FindFirstChild("Hotbar"))
                 local out = {}
                 for att in set do out[#out + 1] = att end
                 table.sort(out)
@@ -11502,15 +12094,9 @@ do
                                 end
 
                                 -- Create config: current settings -> <Config name>.cfg
-                                -- v23.12: no double-click confirm anymore (the 0.5s "Are you
-                                -- sure?" window silently cancelled the save whenever the
-                                -- second click was too late - the config was then NEVER
-                                -- written and loading it later restored old settings); the
-                                -- name is stripped of characters Windows cannot have in a
-                                -- file name; a failed writefile now shows an error instead
-                                -- of dying without any message.
                                 Config:Button({
                                         Name = "Create config",
+                                        Confirm = true,
                                         Callback = function()
                                                 local name = Library.Flags["settings_config_name"]
 
@@ -11519,26 +12105,10 @@ do
                                                         return
                                                 end
 
-                                                name = name:gsub('[\\/:*?"<>|]', ""):gsub("^%s*(.-)%s*$", "%1")
-
-                                                if name == "" then
-                                                        Library.Notification("Invalid config name (symbols only)", 4)
-                                                        return
-                                                end
-
                                                 local ConfigFilePath = string.format("%s%s.cfg", ConfigFolder, name)
                                                 local existed = isfile(ConfigFilePath)
 
-                                                local write_ok, write_err = pcall(writefile, ConfigFilePath, Library.GetConfig())
-
-                                                if not write_ok then
-                                                        Library.Notification("Failed to save config: " .. tostring(write_err), 6)
-                                                        return
-                                                end
-
-                                                if Library.LastSaveSkipped and Library.LastSaveSkipped > 0 then
-                                                        Library.Notification(string.format("Saved with %d unreadable setting(s) skipped.", Library.LastSaveSkipped), 5)
-                                                end
+                                                writefile(ConfigFilePath, Library.GetConfig())
 
                                                 if existed then
                                                         Library.Notification(string.format("Overwrote existing config (%s.cfg).", Utility.RichText(name, Library.Theme.accent)), 5)
@@ -11552,13 +12122,9 @@ do
                                 })
 
                                 -- Load config: loads the config selected in the list
-                                -- v23.12: no double-click confirm (one click loads) and the
-                                -- load report is shown: if the file is missing settings this
-                                -- build registers, the .cfg is from an older build - re-save
-                                -- it (Create config, same name) so the missing toggles are
-                                -- actually written into the file.
                                 Config:Button({
                                         Name = "Load config",
+                                        Confirm = true,
                                         Callback = function()
                                                 local name = selected_config()
 
@@ -11570,21 +12136,16 @@ do
                                                 local ConfigFilePath = string.format("%s%s.cfg", ConfigFolder, name)
 
                                                 if isfile(ConfigFilePath) then
-                                                        local ok, report = pcall(Library.LoadConfig, readfile(ConfigFilePath))
-
-                                                        if not ok then
-                                                                Library.Notification("Failed to load config: " .. tostring(report), 6)
-                                                                return
-                                                        end
-
-                                                        Library.Notification(string.format("Loaded config (%s.cfg): %d settings.", Utility.RichText(name, Library.Theme.accent), report.applied), 5)
-
-                                                        if report.errors > 0 then
-                                                                Library.Notification(string.format("Load warnings: %d setting(s) could not be applied.", report.errors), 5)
-                                                        end
-
-                                                        if report.missing > 0 or report.unknown > 0 then
-                                                                
+                                                        -- v23.12 config fix: a failed load is now reported instead of
+                                                        -- dying silently inside the click handler
+                                                        local load_ok, load_err = pcall(function()
+                                                        	Library.LoadConfig(readfile(ConfigFilePath))
+                                                        end)
+                                                        
+                                                        if load_ok then
+                                                        	Library.Notification(string.format("Successfully loaded config (%s.cfg).", Utility.RichText(name, Library.Theme.accent)), 5)
+                                                        else
+                                                        	Library.Notification("Failed to load config (" .. name .. ".cfg): " .. tostring(load_err), 6)
                                                         end
                                                 else
                                                         Library.Notification(string.format("Failed to load config: invalid file (%s.cfg)", Utility.RichText(name, Library.Theme.accent)), 5)
@@ -11607,16 +12168,7 @@ do
                                                 local ConfigFilePath = string.format("%s%s.cfg", ConfigFolder, name)
 
                                                 if isfile(ConfigFilePath) then
-                                                        local write_ok, write_err = pcall(writefile, ConfigFilePath, Library.GetConfig())
-
-                                                        if not write_ok then
-                                                                Library.Notification("Failed to overwrite config: " .. tostring(write_err), 6)
-                                                                return
-                                                        end
-
-                                                        if Library.LastSaveSkipped and Library.LastSaveSkipped > 0 then
-                                                                Library.Notification(string.format("Saved with %d unreadable setting(s) skipped.", Library.LastSaveSkipped), 5)
-                                                        end
+                                                        writefile(ConfigFilePath, Library.GetConfig())
 
                                                         Library.Notification(string.format("Successfully overwrote config (%s.cfg).", Utility.RichText(name, Library.Theme.accent)), 5)
                                                 else
@@ -14479,16 +15031,6 @@ do
         task.spawn(function()
                 task.wait(1)
 
-                -- v23.12: make sure the WHOLE ui - including the late Local-section
-                -- toggles (AntiMine / Auto loot / Remove water nearby) - has registered
-                -- its config flags before the autoload applies a file.
-                -- "no_water_enabled" is the LAST element created in the build, so once
-                -- its flag exists, every other flag exists too.
-                local settle_deadline = os.clock() + 5
-                while Library.ConfigFlags["no_water_enabled"] == nil and os.clock() < settle_deadline do
-                        task.wait(0.1)
-                end
-
                 if not isfile(AutoloadFile) then
                         return
                 end
@@ -14513,7 +15055,7 @@ do
                 end
 
                 local load_ok, load_err = pcall(function()
-                        return Library.LoadConfig(readfile(ConfigFilePath))
+                        Library.LoadConfig(readfile(ConfigFilePath))
                 end)
 
                 if not load_ok then
@@ -14521,11 +15063,7 @@ do
                         return
                 end
 
-                Library.Notification(string.format("Auto loaded config (%s.cfg): %d settings.", Utility.RichText(name, Library.Theme.accent), load_err.applied), 5)
-
-                if load_err.missing > 0 or load_err.unknown > 0 then
-                        Library.Notification(string.format("This config file is outdated (missing %d / unknown %d settings). Re-save it with Create config to update the file.", load_err.missing, load_err.unknown), 8)
-                end
+                Library.Notification(string.format("Auto loaded config (%s.cfg).", Utility.RichText(name, Library.Theme.accent)), 5)
         end)
 end
 
@@ -15762,112 +16300,6 @@ do
         -- on (Hold mode removed per request); the active state shows in the
         -- on-screen keybinds list.
         fastloot_toggle:Keybind({Name = "Auto loot Corpse", Mode = "Toggle", Modes = {"Toggle"}, Value = false, Flag = "fastloot_all_key", Flip = "fastloot_all_enabled"})
-
-        
-
-        -- hidden background sweep: while the toggle is on it opens the
-        -- closest container that still shows any item inside the fixed
-        -- radius through the same colon InvokeServer call the game uses, so
-        -- the namecall hook grabs EVERY slot exactly like a manual open (and
-        -- on executors without hookmetamethod the sweep grabs directly after
-        -- the open itself). one container per pass, each container at most
-        -- once per session: processed containers are remembered in a
-        -- weak-keyed table, so emptied containers are never reopened and the
-        -- sweep can never spam one target.
-        local fastloot_alive = true
-
-        task.spawn(function()
-                while fastloot_alive do
-                        task.wait(FASTLOOT_PASS_DELAY)
-                        if fastloot_alive and fastloot_enabled then
-                                pcall(function()
-                                        local open_remote = fastloot_loot_remote()
-                                        if not open_remote then
-                                                return
-                                        end
-                                        local dropped = fastloot_ensure_watcher()
-                                        if not dropped then
-                                                return
-                                        end
-                                        if not fastloot_catchup_done then
-                                                -- one chunked catch-up walk of the
-                                                -- current tree when the toggle first
-                                                -- turns on (~400 nodes per frame, so
-                                                -- enabling never hitches either)
-                                                fastloot_catchup_done = true
-                                                task.spawn(function()
-                                                        local children = dropped:GetChildren()
-                                                        for i = 1, #children, 400 do
-                                                                for j = i, math.min(i + 399, #children) do
-                                                                        fastloot_pending[#fastloot_pending + 1] = { node = children[j], depth = 0, tries = 0 }
-                                                                end
-                                                                task.wait()
-                                                        end
-                                                end)
-                                        end
-                                        fastloot_verify_pass(#fastloot_pending > 300 and 300 or 80)
-                                        fastloot_prune_pass(150)
-                                        local origin = character_position()
-                                        local cands, fallback = fastloot_pick(FASTLOOT_RADIUS, origin)
-                                        local entry = nil
-                                        -- live "still has items" check, nearest first
-                                        -- like the old sorted list (capped per pass -
-                                        -- emptied containers stay unprocessed and are
-                                        -- skipped, same as before)
-                                        for i, cand in ipairs(cands) do
-                                                if i > 80 then
-                                                        break
-                                                end
-                                                if fastloot_container_armed(cand.container) then
-                                                        entry = cand.container
-                                                        break
-                                                end
-                                        end
-                                        if not entry and fallback and fastloot_container_armed(fallback) then
-                                                entry = fallback
-                                        end
-                                        if entry then
-                                                fastloot_processed[entry] = true
-                                                fastloot_status("Fast loot: sweeping " .. entry.Name)
-                                                -- colon call on purpose: it goes through
-                                                -- the namecall hook, which grabs every
-                                                -- slot the same way a manual open does
-                                                open_remote:InvokeServer(entry, container_position(entry))
-                                                if not fastloot_hook_installed then
-                                                        -- executor without hookmetamethod:
-                                                        -- the hook never saw the open,
-                                                        -- grab directly after it
-                                                        local fired = grab_all(entry)
-                                                        grab_status(fired, entry)
-                                                end
-                                        end
-                                end)
-                        end
-                end
-        end)
-
-        -- unload drops the state, stops the sweep loop and restores the
-        -- original __namecall; the hook restore is the important part
-        cheat.utility.on_unload(function()
-                fastloot_enabled = false
-                fastloot_alive = false
-                if fastloot_watch_conn then
-                        pcall(function()
-                                fastloot_watch_conn:Disconnect()
-                        end)
-                        fastloot_watch_conn = nil
-                end
-                if fastloot_hook_restore then
-                        fastloot_hook_restore()
-                        fastloot_hook_restore = nil
-                end
-        end)
-end
-
-(getgenv and getgenv() or _G).Unload = function()
-        Library.Unload()
-end
-
         -- ==================================================================
         -- v23.10: remove water nearby (new function)
         -- v23.11 update: radius fixed at 50 (the slider was removed), one
@@ -16085,7 +16517,7 @@ end
 
                 -- ui (built LAST so existing config element ids never shift -
                 -- same rule as every other feature appended before this one)
-                ui.sections.visuals_local:Toggle({Name = "Remove water nearby", Value = false, Flag = "no_water_enabled", Callback = function(bool)
+                ui.sections.visuals_local:Toggle({Name = "Remove water", Value = false, Flag = "no_water_enabled", Callback = function(bool)
                         no_water_enabled = bool
                         if bool then
                                 no_water_last_pos = nil
@@ -16108,3 +16540,108 @@ end
                         no_water_restore_all()
                 end)
         end
+
+        
+
+        -- hidden background sweep: while the toggle is on it opens the
+        -- closest container that still shows any item inside the fixed
+        -- radius through the same colon InvokeServer call the game uses, so
+        -- the namecall hook grabs EVERY slot exactly like a manual open (and
+        -- on executors without hookmetamethod the sweep grabs directly after
+        -- the open itself). one container per pass, each container at most
+        -- once per session: processed containers are remembered in a
+        -- weak-keyed table, so emptied containers are never reopened and the
+        -- sweep can never spam one target.
+        local fastloot_alive = true
+
+        task.spawn(function()
+                while fastloot_alive do
+                        task.wait(FASTLOOT_PASS_DELAY)
+                        if fastloot_alive and fastloot_enabled then
+                                pcall(function()
+                                        local open_remote = fastloot_loot_remote()
+                                        if not open_remote then
+                                                return
+                                        end
+                                        local dropped = fastloot_ensure_watcher()
+                                        if not dropped then
+                                                return
+                                        end
+                                        if not fastloot_catchup_done then
+                                                -- one chunked catch-up walk of the
+                                                -- current tree when the toggle first
+                                                -- turns on (~400 nodes per frame, so
+                                                -- enabling never hitches either)
+                                                fastloot_catchup_done = true
+                                                task.spawn(function()
+                                                        local children = dropped:GetChildren()
+                                                        for i = 1, #children, 400 do
+                                                                for j = i, math.min(i + 399, #children) do
+                                                                        fastloot_pending[#fastloot_pending + 1] = { node = children[j], depth = 0, tries = 0 }
+                                                                end
+                                                                task.wait()
+                                                        end
+                                                end)
+                                        end
+                                        fastloot_verify_pass(#fastloot_pending > 300 and 300 or 80)
+                                        fastloot_prune_pass(150)
+                                        local origin = character_position()
+                                        local cands, fallback = fastloot_pick(FASTLOOT_RADIUS, origin)
+                                        local entry = nil
+                                        -- live "still has items" check, nearest first
+                                        -- like the old sorted list (capped per pass -
+                                        -- emptied containers stay unprocessed and are
+                                        -- skipped, same as before)
+                                        for i, cand in ipairs(cands) do
+                                                if i > 80 then
+                                                        break
+                                                end
+                                                if fastloot_container_armed(cand.container) then
+                                                        entry = cand.container
+                                                        break
+                                                end
+                                        end
+                                        if not entry and fallback and fastloot_container_armed(fallback) then
+                                                entry = fallback
+                                        end
+                                        if entry then
+                                                fastloot_processed[entry] = true
+                                                fastloot_status("Fast loot: sweeping " .. entry.Name)
+                                                -- colon call on purpose: it goes through
+                                                -- the namecall hook, which grabs every
+                                                -- slot the same way a manual open does
+                                                open_remote:InvokeServer(entry, container_position(entry))
+                                                if not fastloot_hook_installed then
+                                                        -- executor without hookmetamethod:
+                                                        -- the hook never saw the open,
+                                                        -- grab directly after it
+                                                        local fired = grab_all(entry)
+                                                        grab_status(fired, entry)
+                                                end
+                                        end
+                                end)
+                        end
+                end
+        end)
+
+        -- unload drops the state, stops the sweep loop and restores the
+        -- original __namecall; the hook restore is the important part
+        cheat.utility.on_unload(function()
+                fastloot_enabled = false
+                fastloot_alive = false
+                if fastloot_watch_conn then
+                        pcall(function()
+                                fastloot_watch_conn:Disconnect()
+                        end)
+                        fastloot_watch_conn = nil
+                end
+                if fastloot_hook_restore then
+                        fastloot_hook_restore()
+                        fastloot_hook_restore = nil
+                end
+        end)
+end
+
+(getgenv and getgenv() or _G).Unload = function()
+        Library.Unload()
+end

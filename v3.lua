@@ -1,3 +1,494 @@
+-- moneyblox | v24.3 fps fix round 7 (behavior-preserving perf pass):
+--   * __namecall hook: `local args = {...}` was built for EVERY method call in the game
+--     (dozens-hundreds per frame). it is now built lazily inside only the branches that
+--     read or rewrite the arguments (Raycast silent-aim / TweenService FOV patch /
+--     FireProjectile / ProjectileInflict / UpdateTilt); GetAttribute reads use
+--     (select(1, ...)) with no allocation. pass-through calls allocate nothing. the
+--     hook logic, branch order and return values are unchanged.
+--   * raycast filter caching: is_visible / is_pos_visible, target_wall_penetration,
+--     calculate_penetration and the leaning branch of get_estimated_origin rebuilt
+--     FilterDescendantsInstances (new table + engine-side filter copy) on every call /
+--     every sim step. the sources are still read fresh each call but the property is
+--     only re-assigned when an entry actually changed.
+--   * grenade trajectory: traj_ignore() (table build + UniversalTables require + pcall)
+--     ran on every grenade_sim STEP (up to 120 per sim, ~36 sims per lineup pass);
+--     it now runs once per simulation (the ignore list cannot change mid-sim).
+--   * hud throttle scope fix: the 10 Hz hud refresh used `return`, which also throttled
+--     the aimbot block below it to 10 Hz whenever the hud card was on screen. the gate
+--     now scopes the hud block only - the aimbot block runs per frame again.
+--   * hud refresh (10 Hz): row/hp/avatar/card layout writes are change-checked, and the
+--     white/green/red + hp gradient colors are hoisted constants instead of new
+--     Color3.fromRGB calls per refresh. fields-table structure untouched.
+--   * player ESP: part_cache stores the Part itself (no per-part {cframe,size} table
+--     allocation per player per frame; cframe/size read live in getBoundingBox and the
+--     skeleton pass - same values, same frame). drop-item classify loop waits 0.1s per
+--     step instead of every frame (label may appear up to 100ms later, display-only).
+--   * player_list heartbeat: humanoid per player and the local player's HRP are cached
+--     per character instead of a child scan every frame.
+--   * get_targets_in_fov: the aim-part list / weighted total / sort comparator are
+--     computed once per call instead of per player per frame (the random pick itself
+--     stays per player).
+--   * neck / look-angle loop: joint references cached per character (re-resolved on
+--     Parent loss) instead of up to 10 FindFirstChild per tick at 60 Hz, and each
+--     C0 / Motor6D lerp write is skipped once converged (identical final poses).
+--   * desync: the heartbeat enable gate moved above the humanoid/hrp/head lookups
+--     (ug_legs_restore unchanged, it self-gates); the visualizer wireframe only clears
+--     while actually drawing (plus one clear on the off-transition), reuses its
+--     buffers and reads workspace.WorldPivot once per frame instead of per vertex.
+--   * misc per-frame waste: aimbot idle loop no longer rewrites the empty indicator
+--     text every frame; bullet_stats is a proper local (was a leaked global every
+--     frame); fov circle Position / snapline From+Color / crosshair (position,
+--     rotation, opacity, glow+flash colors, Visible flags) writes are change-checked
+--     and the flash white is a hoisted constant; underground resolver skips all
+--     character lookups while fully idle; spiderman builds its RaycastParams once per
+--     character; anti-drown caches the GameplayVariables instance; no-fall caches
+--     humanoid/hrp per character; freecam builds its scan closure once and only
+--     writes ReplicationFocus when it changes; vehicle esp caches gui/text, change-
+--     checks text/color/enabled and applies its size once per slider change; boss
+--     tracker recursion no longer double-allocates GetChildren per node; weather
+--     tint endpoints are hoisted constants; skin auto-dress skips the camera scan
+--     while no skins are configured; report notifications cache the Reports instance;
+--     trajectory static colors are change-checked (LINEUP_WHITE hoisted).
+--   * not applied (would change behavior): caching the aimbot target scan behind the
+--     aimbot key gate - the crosshair "Target" position mode reads target_part while
+--     the key is up, so skipping the scan would visibly change that mode.
+--   * the file's line endings are normalized to LF (was CRLF); Lua / executors treat
+--     them identically. no feature, flag, element id or config key was added, removed
+--     or reordered.
+-- moneyblox | target hud replaced with the 789 (no dist / visor / tool) build's version, per request:
+--   * the Target hud card now renders exactly like that build: width 260px (fixed), bottom-center
+--     position (the card bottom sits 94px above the screen bottom), double border (inner frame +
+--     stroke), portrait avatar on the left spanning the card height, plain label/value rows (no
+--     boxes, value column at a fixed 52px offset), centered "100 / 100" health bar and
+--     capitalised row labels (User / KD / Play Time / Status / Reports). still mouse-draggable.
+--   * the "Dist" / "Weapons" / "Visor" rows are gone: the "HUD elements" dropdown drops to 8
+--     options (Avatar / Name / Vis / KDR / KD / Reports / Time / Health), cheat.hud.show loses the
+--     dist / guns / visor keys and the stat-cache pass no longer walks the target's Inventory -
+--     the visor / tool fields and the gray / orange colors are removed with their rows.
+--   * config safe: same flags (hud_enabled / hud_elements) and the hud still creates exactly two
+--     ui elements (toggle + dropdown), so no element id (moneyblox_N) shifts; old configs that
+--     still list "Distance" / "Weapons" / "Visor" load without them (Dropdown drops unknown
+--     values). nothing else was touched: same features, same ids, same behavior.
+-- moneyblox | v23.12 config fix (save / load hardening):
+--   * symptom: settings in the Misc section and the Visuals > Misc "Local"
+--     section (Anti mask / Mute breathing / AntiMine / Auto loot gun /
+--     Auto loot Corpse / Remove water nearby) looked like they were never
+--     saved - loading the config left every toggle off.
+--   * the save/load path itself keys by flag name and every toggle in those
+--     sections registers its flag correctly (audited + simulated), so the
+--     real fix targets the failure modes around it:
+--   * FIX 1 - the load loop now applies every flag inside its own pcall:
+--     one broken value can no longer abort the whole load mid-file (before,
+--     an error left every flag AFTER the broken one unapplied - arbitrary
+--     groups of toggles silently never loaded). LoadConfig returns a report
+--     (applied / errors / unknown / missing) and the config buttons show it:
+--     when the .cfg is MISSING settings this build registers, the file was
+--     written by an OLDER build - the notification says to re-save the
+--     config (Create config with the same name) so the new toggles actually
+--     get written into the file. unknown keys are still skipped like before,
+--     so old configs load exactly as they did.
+--   * FIX 2 - "Create config" / "Load config" no longer need the double
+--     click confirm: the 0.5s "Are you sure?" window silently CANCELLED the
+--     action whenever the second click came too late, so a single click on
+--     Create config simply never wrote the file (looked like "it didn't
+--     save"). "Overwrite config" / "Delete" / "Clear autoload" keep their
+--     confirm. the config name is stripped of characters Windows cannot use
+--     in a file name, and a failed writefile now shows an error notification
+--     instead of dying without any message.
+--   * FIX 3 - GetConfig serializes every flag inside its own pcall and
+--     embeds a "_build" tag, so one unreadable flag can never abort the
+--     whole save anymore.
+--   * FIX 4 - the inject autoload waits (up to 5s) until the whole ui -
+--     including the late Local-section toggles - has registered its flags
+--     before it applies the autoload file.
+--   * nothing else was touched: same features, same element ids (moneyblox_N),
+--     same flags, same behavior; configs saved by older builds still load.
+-- moneyblox | attachment viewer: gun mods now render as item icon grids (pulled from the game's ItemsList) instead of attachment name lists - icon size adjustable via the "Att. icon size" slider
+-- moneyblox | functions trimmed + Unload + Linoria UI (Ardour style ui from violin-suzutsuki/LinoriaLib)
+-- fixed build: silent auto-shoot repaired (robust fire + fallback), legacy spin-mode toggle removed, Desync untouched
+-- v23.10 (remove water nearby, ported from the weerer build - replaces the old "No water near"):
+--   * script 1 carried an older hand-appended "No water near" toggle + "Water remove
+--     distance" slider (flags no_water_near / no_water_distance, Misc section, 0.25s
+--     update loop with 1.5s terrain re-asserts). that whole block is REMOVED and
+--     replaced by the weerer build's "Remove water nearby", ported verbatim (its
+--     v23.10 feature with the v23.11 fps round 6 refinements already applied): ONE
+--     "Remove water nearby" toggle at the very bottom of the Local section (the same
+--     place as in the weerer build, flag no_water_enabled), radius FIXED at 50 studs
+--     (no slider), ONE clearing pass fires after walking 18+ studs since the previous
+--     pass and the standing-still re-assert runs every 5s - far fewer
+--     ReadVoxels/WriteVoxels + GetPartBoundsInBox passes per minute, same clearing
+--     behavior.
+--   * while the toggle is on, the terrain voxels around the local character are
+--     scanned and every Water voxel inside the radius is turned into Air CLIENT-SIDE
+--     ONLY (Terrain ReadVoxels/WriteVoxels - the server never sees it), so walking
+--     near a lake/river deletes the water around the character and the lakebed can
+--     be walked instead of swum. only Water voxels are touched - ground / rock /
+--     sand materials stay, no holes are dug. water built from parts is hidden the
+--     same way (LocalTransparencyModifier, client-only) and the humanoid Swimming
+--     state is held disabled while the toggle is on, so nothing re-triggers
+--     swimming in the cleared area.
+--   * everything is restored when the toggle turns off or on unload: the saved water
+--     voxels (flat x/y/z/mat/occ lists, budget 1,000,000 voxels FIFO) are written
+--     back into a fresh ReadVoxels of each region, hidden parts get their original
+--     transparency back and Swimming is re-enabled - unload returns the world to
+--     vanilla like the MON-50 bypass does. the driver runs through
+--     cheat.utility.new_heartbeat so Unload stops it like every other loop.
+--   * config-safe: the new toggle is created at the same last creation position the
+--     old "No water near" toggle occupied, so no existing element id (moneyblox_N)
+--     shifts; old configs that still carry no_water_near / no_water_distance simply
+--     ignore them (LoadConfig skips unknown flags). nothing else was touched.
+-- v23.9 (underground walk-anim freeze):
+--   * the Underground (desync) gate now freezes the walking animation while
+--     it is active: with "Enabled" + the [B] keybind both on (the SAME gate
+--     the desync pose loop checks), the character's "Animate" script is
+--     disabled and every animation track playing on its Animator is stopped,
+--     so moving around underground no longer swings the legs - the character
+--     glides in a frozen pose instead of playing the walk cycle. movement
+--     itself is untouched (walkspeed, direction and the whole cframe pose
+--     math behave exactly as shipped), and non-Animate animation systems
+--     (tool grips, game scripts that re-play their own tracks) are not
+--     fought - their tracks are only stopped once at freeze time.
+--   * the freeze re-asserts itself: if the game flips the same Animate
+--     script back on, or the character respawns while the gate is still on,
+--     it is disabled again automatically. the per-heartbeat cost while
+--     gliding is ONE FindFirstChild on the local character (never a
+--     workspace walk), and the stop-tracks pass (the
+--     GetPlayingAnimationTracks allocation) only runs when the Animate
+--     script actually flips, so gliding stays free.
+--   * the moment the gate turns off - menu toggle, keybind or a config
+--     load re-driving the bind - the exact Animate instance that was
+--     disabled is re-enabled and animations behave like vanilla again.
+--     Unload does the same through cheat.utility.on_unload, plus a flag
+--     that stops the still-alive raw desync heartbeat from re-freezing
+--     after unload (the pose loop itself is untouched, exactly as shipped).
+--   * no new ui elements and no new config flags: element ids (moneyblox_N)
+--     are untouched and saved configs load exactly as before.
+-- v23.8 (sky resolver removed entirely + fps fix round 5):
+--   * the whole Sky resolver feature is gone per request: the "Sky resolver"
+--     toggle and its keybind, the "Sky height" / "Sky sit" / "Sky shoot from
+--     ground" / "Sky auto drop" controls, the two MouseButton1 input
+--     connections and the hover renderstepped loop behind them, together
+--     with every skyres_* config flag. saved configs load exactly as
+--     before - they key by flag name and LoadConfig skips unknown flags,
+--     so a stored skyres_* entry, if any, is simply ignored and every
+--     other control still receives its own values. the other resolvers
+--     (Desync / Angle / Underground) are untouched and keep their exact
+--     current behavior, including the underground-owns-the-character rule.
+--   * fps fix round 5 - the leftovers the earlier audit rounds did not
+--     touch yet:
+--     1. the desync/angle resolver PreRender walk did a per-player
+--        FindFirstChild("HumanoidRootPart") EVERY frame even with both
+--        resolvers off, and it was a raw PreRender connection Unload could
+--        not stop. now one boolean check skips the whole walk while both
+--        are off, and the loop runs through cheat.utility.new_renderstepped
+--        so Unload stops it like every other loop. with a resolver enabled
+--        the walk itself is unchanged.
+--     2. the freecam ReplicationFocus scan walked the WHOLE workspace
+--        (workspace:GetDescendants) five times a second while freecam was
+--        active - a full map materialization every 0.2s, the same hitch
+--        class the mine manipulation / no leafs fixes removed. rebuilt with
+--        the same event-driven pattern: ONE chunked workspace snapshot when
+--        freecam activates (~8000 entries per frame, so enabling never
+--        hitches either), a workspace.DescendantAdded watcher that tracks
+--        models streaming in later, dead entries pruned on every pass, and
+--        the 0.2s pass only iterates the tracked model set. the
+--        ReplicationFocus write itself behaves exactly as before (cleared
+--        when freecam is off, set to the closest model when on).
+--     3. the desync preparation path contained a raw `repeat until tick()`
+--        busy-wait - a 0.8s full-thread spin that hard-freezes the game
+--        (fps drops to 0 for 0.8s straight) whenever it runs. replaced with
+--        task.wait(0.8): same delay, but it yields properly instead of
+--        stalling every frame.
+--   * the freecam PreRender also wrote hrp.Anchored both ways every frame
+--     even when the value did not change; both writes now only fire on
+--     change (same rule as the esp rotation write fix from round 3).
+--   * nothing else was touched: same features, same behavior.
+-- v23.7 (neon fov feature removed entirely, per request):
+--   * the "Neon FOV" toggle and its "Neon FOV color" picker are gone from
+--     the Effects/Logs section, together with everything behind them: the
+--     4-circle glow renderer, its renderstepped loop, the drawings and the
+--     two config flags "neon_fov_enabled" / "neon_fov_color". those two
+--     elements were the last ui elements ever created, so no other element
+--     id moved and saved configs load exactly as before (a stored neon
+--     flag, if any, is simply ignored - LoadConfig skips unknown flags).
+--     nothing else was touched: same features, same ids, same behavior.
+-- v23.6 (auto loot keybinds: press once = on, Hold mode removed):
+--   * both auto loot keybinds ("Auto loot gun" + "Auto loot all") offered
+--     a right-click "Hold" mode listed FIRST in the mode menu, and in Hold
+--     mode the feature runs ONLY while the key is physically held down -
+--     with a key set, loot stopped the moment the key was released, so the
+--     features felt broken while running around. per request both pickers
+--     are now Toggle-only: pick a key and ONE press flips the feature on
+--     and it stays on while the character runs anywhere; press again (or
+--     click the toggle in the menu) to turn it off. the Hold entry is gone
+--     from the mode menu, and a "Hold" value saved in an old config (if
+--     any) loads back as Toggle. nothing else changed: same keybind flags
+--     and _data format, same element ids (only the Modes list of the two
+--     pickers was edited, no element moved), loot logic untouched, and the
+--     keybinds of every other function keep their exact current behavior.
+-- v23.5 (toggle keybinds for both auto loot features):
+--   * "Auto loot gun" and "Auto loot all" each get a keybind picker built
+--     with their toggle: pick any key in the menu and pressing it flips
+--     the feature on/off with the same semantics as the menu key opening
+--     and closing the ui (the picker also offers Hold mode = loot only
+--     while the key is down). implemented with a new optional "Flip"
+--     keybind option: when set, the compat keybind drive also drives the
+--     linked toggle's config flag, so one key press flips the real
+--     feature (its callback, flag and on-screen status all update, same
+--     as a menu click). a small sync keeps the picker aligned when the
+--     feature is toggled from the menu instead, so the next press always
+--     does the right thing. existing keybinds (Link-based gate binds)
+--     keep their exact current behavior - they do not pass Flip.
+--   * both keybinds show in the on-screen keybinds list like every other
+--     bind ("[...]" until a key is picked, highlighted while the feature
+--     is on; the keybinds list View setting still decides Pressed/All).
+--     they save through the standard <flag>_data config mechanism. the
+--     config format is flag-keyed, so the two new picker element ids
+--     shift nothing in saved configs and no existing ui element moved.
+-- v23.4 (neon fov + match aimbot fov merged into one toggle, fps fix hardening):
+--   * the separate "Match aimbot fov" toggle is gone: "Neon FOV" now IS the
+--     linked mode - turning it on always projects the neon halo from the
+--     aimbot's own "Aim size" slider with the same formula as the "Aimbot
+--     fov" circle, and it follows the FOV changer / zoom. the standalone
+--     pixel size slider was removed with it (the link is the only mode).
+--     both neon elements were built at the end of the ui, so no existing
+--     config element id moved, and LoadConfig skips unknown flags, so old
+--     saved configs still load fine (the two retired flags are ignored).
+--   * fps fix hardening: extra variant patterns for the fade-loop /
+--     fade-wait libstring patches (pairs-style loop, no-space loop,
+--     semicolon-less wait) so the ui open/close tween storm also stays
+--     dead if the upstream LinoriaLib text shifts a bit. every variant
+--     is a no-op when its exact text is absent. all fps patches touch
+--     ONLY the menu fade animation - no feature, element or callback
+--     behavior changes anywhere.
+-- v23.3 fps fix round 4 (ui open/close tween storm + neon fov linked to aimbot fov):
+--   * ui open/close fps dip: stock LinoriaLib fades the menu on every
+--     open/close by walking Outer:GetDescendants() and creating 1-2
+--     TweenService tweens PER descendant - on this ui that is hundreds of
+--     simultaneous tweens plus a full tree walk in a single frame, once on
+--     open and once on close. two new libstring patches (C+D next to the
+--     v22.3 cursor patches) turn the fade loop into a no-op and drop the
+--     fade wait, so the window shows/hides instantly with zero tween
+--     churn - same layout, same look, no fade animation. patches are
+--     no-ops on stock/changed upstream source.
+--   * neon fov is now linked to the aimbot fov by default: the halo radius
+--     is projected from the same "Aim size" slider value (Flag
+--     "aimbot_fov_size") with the same formula the "Aimbot fov" circle
+--     uses, so the neon ring always sits exactly on the circle the aimbot
+--     (and silent aim / tp kill - everything that reads the fov) aims
+--     through, and it follows the FOV changer / zoom automatically. a new
+--     "Match aimbot fov" toggle (created last, config ids untouched) turns
+--     the link off to get the old standalone pixel size back. the neon
+--     render loop also skips drawing writes that did not change (same rule
+--     as the esp rotation write fix from round 3).
+--   * untouched on purpose: silent aim / autoshoot, freecam, underground /
+--     desync, and everything fixed in rounds 1-3 exactly as shipped.
+-- v23.2 fps fix round 3 (dead aimbot wireframe sweep + esp rotation writes;
+--   silent aim / freecam / Underground untouched):
+--   * the Combat > Misc "Hold bullets" do-block still created a leftover
+--     WireframeHandleAdornment and cleared it EVERY frame through a
+--     renderstepped connection - but nothing ever drew into it (the only
+--     AddLines calls in the build belong to the per-player esp skeleton
+--     and the Underground visualizer, both on their own instances). the
+--     instance and the per-frame clear loop are gone; the hold bullets
+--     toggle itself is untouched and behaves exactly the same.
+--   * player esp render wrote main_holder.Rotation and the box gradient
+--     Rotation every frame even when both spin options were off (the
+--     values never changed). both writes are now skipped when the value
+--     is already correct - spinning holders/gradients behave identical.
+--   * untouched on purpose: silent aim / autoshoot and its target scan,
+--     freecam (including its ReplicationFocus scan), underground /
+--     desync, and everything fixed in rounds 1-2 exactly as shipped.
+-- v23.2 fps fix round 2 (mine manipulation + no leafs; silent aim / freecam / Underground untouched):
+--   * audit round 1 rebuilt the MON-50 bypass (v23.1). this round fixes the
+--     two remaining periodic full-tree walks found in the audit - the same
+--     class of recurring frame spike, same cure, everything else untouched.
+--   * mine manipulation: the old loop walked workspace:GetDescendants (the
+--     whole map) EVERY 0.5s while the toggle was on, on top of firing the
+--     mines - a full map materialization twice a second. now: mines in the
+--     known AiZones folders are still read directly (that part is cheap),
+--     loose mines live in a tracked set filled by ONE chunked workspace
+--     snapshot taken when the toggle goes on (~5000 entries per frame) plus
+--     a workspace.DescendantAdded watcher that catches mines planted or
+--     streamed in later. dead entries are pruned on every pass. explode
+--     (0.5s) / deactivate (5s) cadences and trigger resolution unchanged,
+--     and the action loop now runs through cheat.utility.new_heartbeat so
+--     Unload stops it (the old raw task.spawn loop kept running after
+--     unload).
+--   * no leafs: the old code re-walked the whole SpawnerZones/Foliage tree
+--     every 10s while enabled. now: one chunked walk on enable (2000 nodes
+--     per frame), a DescendantAdded watcher scoped to the Foliage folder
+--     that hides a leaf the moment its SurfaceAppearance streams in, a
+--     cheap 2s re-assert of only the already-hidden nodes (dead ones
+--     pruned), and the old toggle-off restore walk kept but chewed over
+--     frames. unload disconnects the watcher and restores every hidden
+--     leaf.
+--   * untouched on purpose: silent aim / autoshoot, freecam (including its
+--     ReplicationFocus scan), underground / desync, and the v23.1 MON-50
+--     bypass exactly as shipped.
+-- v23.1 MON-50 bypass fps rebuild (same feature, no more frame spikes):
+--   * v23.0 re-scanned the WHOLE workspace every 0.5s while enabled:
+--     workspace:GetDescendants on a big map materializes a huge list in one
+--     frame, so the fps jerked every 0.5s. the feature worked but that loop
+--     was the hitch, so it is gone.
+--   * the toggle is now event-driven: a workspace.DescendantAdded watcher
+--     (connected once, basically free while disabled) instantly disables
+--     every MON-50 that shows up - planted later, streamed back in - and
+--     every part the game re-creates inside an existing mine (short capped
+--     ancestor walk). zero per-frame scanning while playing.
+--   * the only full scan left is ONE workspace snapshot taken the moment
+--     the toggle goes on, and even that is chewed through in ~5000-entry
+--     chunks per frame, so enabling the toggle does not hitch either.
+--   * the old rescan also re-disabled parts whose CanTouch the game flipped
+--     back. kept as a cheap pass: every 0.5s only the already-flipped parts
+--     are re-asserted (usually a handful), dead ones pruned - not a
+--     workspace walk.
+--   * unload safety: cheat.utility gained on_unload(), a cleanup registry
+--     for raw signal connections (they cannot live in the heartbeat
+--     tables). unloading now disconnects the watcher, drops any pending
+--     chunk pass and puts every flipped part back, so unload returns the
+--     map to vanilla.
+-- v23.0 MON-50 bypass (new function: walking near a MON-50 no longer trips it):
+--   * new "MON-50 bypass" toggle at the bottom of the Misc section (right
+--     side, under the mine manipulation controls): while enabled, every part
+--     of every MON-50 in the world is set to CanTouch=false, and Roblox only
+--     fires the Touched event when BOTH touching parts have CanTouch=true,
+--     so the mine can never feel the character no matter how close you walk.
+--     that is the same trigger path the game's mines use (mine manipulation
+--     explodes them by firing Touched on their Trigger parts with
+--     firetouchinterest), so cutting Touched off kills the detonation for
+--     real. mines stay visible and in place, they just never react.
+--   * the sweep finds MON-50 models/parts by name (mon-50 / mon50 / mon_50 /
+--     mon 50, case-insensitive) and walks up to the parent model the same
+--     way the mine manipulation scanner does. it skips anything carried by
+--     a player (a "MON-50" tool in a hand is not armed) and loose loot under
+--     workspace.DroppedItems, so pickup touch logic is never broken.
+--   * turning the toggle off puts every flipped part back (CanTouch=true),
+--     so the mines work again; parts the mine system destroys itself are
+--     just skipped. the sweep re-runs every 0.5s while enabled through
+--     cheat.utility.new_heartbeat, so mines planted later or parts the game
+--     re-creates are caught too, and Unload stops the sweep like every
+--     other loop (no raw task.spawn loop that keeps running after unload).
+--   * the toggle is built at the very END of the ui build (after the v22.8
+--     autoload block) for the same reason as the v22.7 Local toggles:
+--     element ids (moneyblox_N) are handed out in creation order and
+--     existing configs key by them - adding it earlier would shift every
+--     later id and load old configs into the wrong controls.
+-- v22.7 Local section restored (ported back from the full build):
+--   * "Remove screen effects" + "Mute breathing" moved from the full build
+--     into this Linoria build. they live in a new "Local" section
+--     (Visuals > Misc subtab, right side) using the same toggle names and
+--     flag names as the full build (no_screen_effects / lcl_mute_breathing),
+--     so both features save into configs and reload with them again.
+--   * the two toggles are built at the very END of the ui build on
+--     purpose: element ids (moneyblox_N) are handed out in creation order
+--     and existing configs key by them - building the toggles earlier
+--     would shift every later id and load old configs into the wrong
+--     controls.
+--   * both loops run through cheat.utility.new_heartbeat, so Unload stops
+--     them (the full build's raw while-loop kept running after unload),
+--     and the screen-effects state is applied instantly on toggle instead
+--     of waiting for the next 0.5s sweep.
+-- v22.9 Clear autoload:
+--   * new "Clear autoload" button in the Settings > Main > Config section
+--     (right after "Set as autoload"): deletes
+--     moneyblox\Configs\autoload.txt, puts the "Current autoload config"
+--     line back to "none" and says that nothing will auto load on the next
+--     inject. pressing it while no autoload is set just tells you so (and
+--     fixes the label if it was out of sync). Confirm = true like Delete so
+--     a stray click cannot wipe the autoload.
+--   * the inject autoload task now treats an empty autoload.txt as "no
+--     autoload" too: it deletes the empty file and skips the load, so a
+--     half cleared state can never auto load.
+--   * Unload paths untouched: the Unload button at the bottom of the config
+--     section, Library.Unload and getgenv().Unload stay as they were, and
+--     every loop keeps going through cheat.utility.new_heartbeat so Unload
+--     still stops all of them.
+-- v22.8 SaveManager config section (the config menu from the Ardour /
+--   LinoriaLib SaveManager screenshot):
+--   * the Settings > Main > Config section now uses the exact SaveManager
+--     button set: "Create config" (writes the current settings to a new
+--     .cfg named after the "Config name" box), "Load config" (loads the
+--     config selected in the list), "Overwrite config" (writes the current
+--     settings over the SELECTED .cfg), "Refresh list" (re-reads
+--     moneyblox\Configs), "Set as autoload" (stores the selected config in
+--     moneyblox\Configs\autoload.txt) and a "Current autoload config: x"
+--     line that follows the autoload file (same behaviour as SaveManager).
+--   * the old combined "Save" button is covered by Create (new config) +
+--     Overwrite (existing config); "Delete" is kept as an extra button.
+--     the two list flags keep their names (settings_config_list /
+--     settings_config_name) so older configs still load into them.
+--   * the autoload config is applied once on inject, in a task.spawn that
+--     waits until the whole ui and every flag/callback is registered, and
+--     reuses Library.LoadConfig (so the v22.6 bind re-drive still applies).
+--   * the 5s list sweep is routed through cheat.utility.new_heartbeat so
+--     Unload stops it like every other loop. the Unload button at the
+--     bottom of the config section, Library.Unload and getgenv().Unload
+--     are untouched.
+-- v22.5 fully hidden xyz values (replaces the v22.4 popup idea):
+--   * the X/Y/Z offset + X/Y/Z rotate sliders are REMOVED from the ui
+--     completely - nothing is rendered in the main menu, no popup panel is
+--     spawned on run, and toggling Underground Enabled/Visualize shows
+--     nothing extra. the section just looks like it never had sliders.
+--   * the offset/rotate VALUES still work in the background: the exact same
+--     locals keep feeding the heartbeat cframe math, and the desync_* flags
+--     stay registered (Library.Flags + Library.ConfigFlags) the same way the
+--     real sliders registered them, so saving a config still includes these
+--     values and loading an older config still applies them silently.
+-- v22.6 config fix (Save + Load now keep EVERY Underground setting):
+--   * FIX 1 - the hidden xyz offset/rotate values saved as 0. v22.5 seeded
+--     Library.Flags["desync_*"] with a hardcoded 0 and never synced it with
+--     the real runtime locals (y offset -3.9, rotate 108/180/180 deg), so
+--     the .cfg file contained desync_y_offset=0 etc. and loading that config
+--     OVERWROTE the real pose with zeros - Underground looked reset after
+--     every save/load. the hidden flags are now seeded from the actual
+--     runtime values (rotate stored back in the old slider domain 0-20, so
+--     configs saved by v22.4 and older still load identically).
+--   * FIX 2 - "Toggle" mode keybinds (Underground [B], flyhack, zoom,
+--     thirdperson, tp kill, ...) did not come back active after a config
+--     load: the loader restored the key + mode but never re-drove the bind,
+--     so the feature stayed off until the key was pressed again and the
+--     menu box kept showing it as off. binds whose saved state was ON are
+--     now re-activated by a post-load pass that runs AFTER the whole config
+--     applied (config flags iterate in hash order, so driving a bind during
+--     the loop could read flags that were not loaded yet - the pass is
+--     order-independent). Hold binds are never auto-activated; "Always"
+--     mode was already handled by the loader itself.
+--   * FIX 3 - the Underground section is built behind getfflag(...); on
+--     executors without an fflag API that call errored and killed the whole
+--     section build BEFORE any toggle existed, so nothing Underground could
+--     ever be saved. the fflag read is now pcall-guarded with safe defaults.
+-- v22.3 fps fix (menu-open fps drop, ui now behaves like the original build):
+--   * LinoriaLib draws its own mouse cursor with two Drawing triangles and
+--     refreshes them EVERY frame while the menu is open: a MouseIconEnabled
+--     write + GetMouseLocation + 7 drawing property writes per frame, and the
+--     executor has to render the drawing overlay on top of the game every
+--     frame. the original Sakura UI used the native Roblox cursor with zero
+--     per-frame cost, so the Linoria build lost fps whenever the menu was
+--     open. gameplay loops were already leaner than the old build; this was
+--     the only remaining per-frame cost the old ui did not have.
+--   * the cursor block is now neutralized before loadstring: the spawned
+--     cursor thread returns immediately, no Drawing object is ever created
+--     and the native Roblox cursor stays visible (same as the original ui).
+--     if the library on GitHub changes and neither patch matches, behaviour
+--     falls back to stock LinoriaLib (custom cursor) instead of crashing.
+-- v22.2 keybind list fix:
+--   * kb.Set used type() to detect tables, but on Roblox type(EnumItem) is
+--     "table" too, so the EnumItem branch (picker:SetValue) never ran: the
+--     menu key box stayed "None" instead of "..." and keys loaded from a
+--     config never applied. now uses typeof() (EnumItem -> "EnumItem").
+--   * unbound keybinds show "..." in the menu box right away, before any
+--     key is picked (matches the on-screen list).
+--   * keybind rows refresh (text + accent color) when a key drives the
+--     function on/off.
+-- v22.1 HOTFIX (ui build crashed):
+--   * capture() called container:GetChildren() on Linoria groupbox objects,
+--     which are Lua tables without that method -> the first toggle created
+--     errored and the whole ui stayed empty (only section headers showed).
+--     now snapshots container.Container (the real frame instance) with a
+--     pcall fallback.
+--   * Drawing lib / font / image loading is guarded so missing executor
+--     features can no longer abort the ui build.
 --!native
 --!optimize 2
 

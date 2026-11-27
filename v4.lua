@@ -1,6 +1,41 @@
 -- moneyblox | attachment viewer ported from the inventory-viewer build: gun mods render as item icon grids (pulled from the game's ItemsList) - icon size + position adjustable via the "Att. icon size" / "Att. size" / "Att. X" / "Att. Y" sliders
 -- moneyblox | functions trimmed + Unload + Linoria UI (Ardour style ui from violin-suzutsuki/LinoriaLib)
 -- fixed build: silent auto-shoot repaired (robust fire + fallback), legacy spin-mode toggle removed, Desync untouched
+-- v23.16 (functions ported from the full build, per request):
+--   * Gun changer / Arm changer / Viewmodel changer (Visuals > Misc > Local
+--     section): the three toggles with their sub-controls (Gun color +
+--     Gun material, Arm color + Arm material, Viewmodel X/Y/Z offset) are
+--     ported from the full build. this build already carried the vm logic
+--     (vmpos / vmchams + the state locals) but nothing ever drove it: the
+--     Camera hooks are now connected (with cheat.utility.on_unload cleanup,
+--     same convention as every other raw connection here) and the Local
+--     section ui writes the exact locals the logic reads through a
+--     cheat.vm_changer_api bridge (the Local section ui is built in a later
+--     scope, outside the visuals do-block that owns those locals). same
+--     rows, same flag names, same hide-until-toggle-on State() behavior and
+--     the same colors / material dropdown values as the full build.
+--   * Hit sound (Combat > Misc > Effects/Logs): toggle + volume slider +
+--     speed slider + sound selection dropdown, driving the existing
+--     ProjectileInflict hook unchanged. the hit sound pack (Bameware, Bell,
+--     Bubble, Pick, Pop, Rust, Sans, Fart, Big, Vine, Bruh, Skeet,
+--     Neverlose, Fatality, Bonk, Minecraft - same rbxassetid ids) is now
+--     created right next to cheat.hitsounds and preloaded once: the table
+--     used to stay EMPTY in this build, so hit_sound_instance was nil and
+--     the hook had nothing to play.
+--   * "No leafs" was already ported earlier (the v23.2 event-driven
+--     version, same view_no_leafs flag) and is untouched; Kill sound was
+--     NOT part of the requested pictures and stays unported (its
+--     kill_sound_* config keys stay unused, exactly as before).
+--   * config safe: every new flag (gun_changer / gun_color / gun_material /
+--     arm_changer / arm_color / arm_material / viewmodel_changer /
+--     viewmodel_x / viewmodel_y / viewmodel_z / hit_sound /
+--     hit_sound_volume / hit_sound_speed / hit_sound_id) is a NEW key -
+--     Library.LoadConfig keys by flag name and skips unknown flags, so old
+--     configs load exactly as before and the new toggles save / restore
+--     with configs. element ids: the three changer toggles + hit sound are
+--     built at the very END of the ui build (hit sound inside the existing
+--     Effects/Logs block, the changers after Mute breathing in the Local
+--     section), so no existing element id moved.
 -- v23.15 (target hud setup locked - size / position sliders removed, per request):
 --   * the "HUD width" / "HUD height (0 = auto)" / "HUD Y" sliders are gone
 --     from the menu. the values they were left at are now baked in as the
@@ -2722,6 +2757,45 @@ local cheat = {
         hooks = {},
         hitsounds = {}
 }
+
+-- v23.16 port (from the full build): the hit sound pack. this build declared
+-- an empty cheat.hitsounds, so hit_sound_instance was nil and the
+-- ProjectileInflict hook had nothing to play. same names, same
+-- rbxassetid ids, sounds are preloaded once exactly like the full build
+-- does (PreloadAsync is pcall-guarded so an executor without it can never
+-- abort the load).
+do
+    local sounds = {}
+    for name, id in {
+        Bameware = "rbxassetid://3124331820",
+        Bell = "rbxassetid://6534947240",
+        Bubble = "rbxassetid://6534947588",
+        Pick = "rbxassetid://1347140027",
+        Pop = "rbxassetid://198598793",
+        Rust = "rbxassetid://1255040462",
+        Sans = "rbxassetid://3188795283",
+        Fart = "rbxassetid://130833677",
+        Big = "rbxassetid://5332005053",
+        Vine = "rbxassetid://5332680810",
+        Bruh = "rbxassetid://4578740568",
+        Skeet = "rbxassetid://5633695679",
+        Neverlose = "rbxassetid://6534948092",
+        Fatality = "rbxassetid://6534947869",
+        Bonk = "rbxassetid://5766898159",
+        Minecraft = "rbxassetid://4018616850",
+    } do
+        local sound = Instance.new("Sound")
+        sound.SoundId = id
+        cheat.hitsounds[name] = sound
+        table.insert(sounds, sound)
+    end
+
+    task.spawn(function()
+        pcall(function()
+            game:GetService("ContentProvider"):PreloadAsync(sounds, function(...) end)
+        end)
+    end)
+end
 
 
 local project_delta = {
@@ -6509,6 +6583,38 @@ do
                         bullet_tracers_color = color.c
                 end})
 
+                -- v23.16 port (from the full build): Hit sound. drives the
+                -- existing ProjectileInflict hook (hit_sound / hit_sound_instance /
+                -- hit_sound_volume / hit_sound_speed locals at the top of this
+                -- script) - volume / speed / sound selection hide until the toggle
+                -- is on, same State() behavior as the full build.
+                local hitsound_volume_slider, hitsound_speed_slider, hitsound_selection_dropdown = nil, nil, nil
+                local hitsound_toggle = effsec:Toggle({Name = "Hit sound", Value = false, Flag = "hit_sound", Callback = function(bool)
+                        hit_sound = bool
+                        local vis = bool and true or false
+                        if hitsound_volume_slider then hitsound_volume_slider.State(vis) end
+                        if hitsound_speed_slider then hitsound_speed_slider.State(vis) end
+                        if hitsound_selection_dropdown then hitsound_selection_dropdown.State(vis) end
+                end})
+                hitsound_volume_slider = effsec:Slider({Name = "Hit sound volume", Min = 0.1, Max = 10, Float = 0.1, Value = 1, Flag = "hit_sound_volume", Suffix = "", Callback = function(int)
+                        hit_sound_volume = int
+                end})
+                hitsound_volume_slider.State(false)
+                hitsound_speed_slider = effsec:Slider({Name = "Hit sound speed", Min = 0.1, Max = 3, Float = 0.1, Value = 1, Flag = "hit_sound_speed", Suffix = "", Callback = function(int)
+                        hit_sound_speed = int
+                end})
+                hitsound_speed_slider.State(false)
+                hitsound_selection_dropdown = effsec:Dropdown({Name = "Hit sound selection", Values = (function()
+                        local hitsounds = {}
+                        for name, _ in cheat.hitsounds do
+                                table.insert(hitsounds, name)
+                        end
+                        return hitsounds
+                end)(), Value = "Bameware", Flag = "hit_sound_id", Multi = false, Callback = function(str)
+                        hit_sound_instance = cheat.hitsounds[str]
+                end})
+                hitsound_selection_dropdown.State(false)
+
 
                 local make_beam = cheat.make_beam
                 local bullet_module = require(game:GetService("ReplicatedStorage"):WaitForChild("Modules"):WaitForChild("FPS"):WaitForChild("Bullet"))
@@ -8167,6 +8273,45 @@ do
                         end
                 end
         end)
+
+        -- v23.16 port (from the full build): the camera hooks that drive the
+        -- gun / arm / viewmodel changers. this build defined vmpos / vmchams /
+        -- vmunpos above but never connected them, so the changers could never
+        -- run. raw signal connections are registered with
+        -- cheat.utility.on_unload so Unload disconnects them (same convention
+        -- as every other raw connection in this build).
+        local vm_conn_child = Camera.ChildAdded:Connect(vmpos)
+        local vm_conn_desc = Camera.DescendantAdded:Connect(vmchams)
+        local vm_conn_removed = Camera.ChildRemoved:Connect(vmunpos)
+        cheat.utility.on_unload(function()
+                pcall(function() vm_conn_child:Disconnect() end)
+                pcall(function() vm_conn_desc:Disconnect() end)
+                pcall(function() vm_conn_removed:Disconnect() end)
+        end)
+
+        -- v23.16 port: state bridge for the Local section ui (built later,
+        -- OUTSIDE this visuals do-block - the changer locals above are upvalues
+        -- of this scope, so the ui callbacks write them through these setters).
+        -- names / flags / behavior are identical to the full build.
+        cheat.vm_changer_api = {
+                set_gun_changer = function(v) gun_changer = v end,
+                set_gun_color = function(v) gun_color = v end,
+                set_gun_material = function(v) gun_material = v end,
+                set_arm_changer = function(v) arm_changer = v end,
+                set_arm_color = function(v) arm_color = v end,
+                set_arm_material = function(v) arm_material = v end,
+                set_viewmodel_changer = function(v) viewmodel_changer = v end,
+                get_viewmodel_changer = function() return viewmodel_changer end,
+                set_viewmodel_x = function(v) viewmodel_x = v end,
+                set_viewmodel_y = function(v) viewmodel_y = v end,
+                set_viewmodel_z = function(v) viewmodel_z = v end,
+                apply_viewmodel = function()
+                        local vm = _FindFirstChildOfClass(Camera, "Model")
+                        if vm then
+                                vmpos(vm)
+                        end
+                end,
+        }
 
         do
                 local old_fov = Camera.FieldOfView
@@ -14721,6 +14866,80 @@ do
                         pcall(mute_breath, not (breath_sound and breath_sound.Parent))
                 end
         end)
+
+        -- v23.16 port (from the full build): Gun changer / Arm changer /
+        -- Viewmodel changer. built at the very END of the Local section so no
+        -- existing element id moved (same rule as the v22.7 toggles above).
+        -- the toggles drive cheat.vm_changer_api (the vm logic locals live in
+        -- the visuals do-block scope, see the camera hooks there); the
+        -- color / material / offset sub-controls hide until their toggle is
+        -- on, same rows / flags / State() behavior as the full build.
+        local vm_api = cheat.vm_changer_api
+
+        local gun_color_picker, gun_mat_dropdown = nil, nil
+        local gun_toggle = lclsec:Toggle({Name = "Gun changer", Value = false, Flag = "gun_changer", Callback = function(bool)
+                vm_api.set_gun_changer(bool)
+                local vis = bool and true or false
+                if gun_color_picker then gun_color_picker.State(vis) end
+                if gun_mat_dropdown then gun_mat_dropdown.State(vis) end
+        end})
+        gun_color_picker = lclsec:Colorpicker({Name = "Gun color", Value = Color3.new(1, 1, 1), Usealpha = false, Flag = "gun_color", Callback = function(color)
+                vm_api.set_gun_color(color.c)
+        end})
+        gun_color_picker.State(false)
+        gun_mat_dropdown = lclsec:Dropdown({Name = "Gun material", Values = {"ForceField", "Neon", "SmoothPlastic", "Glass"}, Value = "ForceField", Flag = "gun_material", Multi = false, Callback = function(str)
+                vm_api.set_gun_material(str and Enum.Material[str] or Enum.Material.ForceField)
+        end})
+        gun_mat_dropdown.State(false)
+
+        local arm_color_picker, arm_mat_dropdown = nil, nil
+        local arm_toggle = lclsec:Toggle({Name = "Arm changer", Value = false, Flag = "arm_changer", Callback = function(bool)
+                vm_api.set_arm_changer(bool)
+                local vis = bool and true or false
+                if arm_color_picker then arm_color_picker.State(vis) end
+                if arm_mat_dropdown then arm_mat_dropdown.State(vis) end
+        end})
+        arm_color_picker = lclsec:Colorpicker({Name = "Arm color", Value = Color3.new(1, 1, 1), Usealpha = false, Flag = "arm_color", Callback = function(color)
+                vm_api.set_arm_color(color.c)
+        end})
+        arm_color_picker.State(false)
+        arm_mat_dropdown = lclsec:Dropdown({Name = "Arm material", Values = {"ForceField", "Neon", "SmoothPlastic", "Glass"}, Value = "ForceField", Flag = "arm_material", Multi = false, Callback = function(str)
+                vm_api.set_arm_material(str and Enum.Material[str] or Enum.Material.ForceField)
+        end})
+        arm_mat_dropdown.State(false)
+
+        local vm_x_slider, vm_y_slider, vm_z_slider = nil, nil, nil
+        local vm_toggle = lclsec:Toggle({Name = "Viewmodel changer", Value = false, Flag = "viewmodel_changer", Callback = function(bool)
+                vm_api.set_viewmodel_changer(bool)
+                local vis = bool and true or false
+                if vm_x_slider then vm_x_slider.State(vis) end
+                if vm_y_slider then vm_y_slider.State(vis) end
+                if vm_z_slider then vm_z_slider.State(vis) end
+        end})
+        vm_x_slider = lclsec:Slider({Name = "X offset", Min = -5, Max = 5, Float = 0.1, Value = 0, Flag = "viewmodel_x", Callback = function(int)
+                vm_api.set_viewmodel_x(int)
+                if not vm_api.get_viewmodel_changer() then
+                        return
+                end
+                vm_api.apply_viewmodel()
+        end})
+        vm_x_slider.State(false)
+        vm_y_slider = lclsec:Slider({Name = "Y offset", Min = -5, Max = 5, Float = 0.1, Value = 0, Flag = "viewmodel_y", Callback = function(int)
+                vm_api.set_viewmodel_y(int)
+                if not vm_api.get_viewmodel_changer() then
+                        return
+                end
+                vm_api.apply_viewmodel()
+        end})
+        vm_y_slider.State(false)
+        vm_z_slider = lclsec:Slider({Name = "Z offset", Min = -5, Max = 5, Float = 0.1, Value = 0, Flag = "viewmodel_z", Callback = function(int)
+                vm_api.set_viewmodel_z(int)
+                if not vm_api.get_viewmodel_changer() then
+                        return
+                end
+                vm_api.apply_viewmodel()
+        end})
+        vm_z_slider.State(false)
 end
 
 -- v22.8: autoload config (SaveManager style). runs in its own task AFTER

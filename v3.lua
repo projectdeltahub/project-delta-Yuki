@@ -1,3 +1,51 @@
+-- moneyblox | v23.13 (Gun changer / Arm changer / Viewmodel changer + Hit sound, ported from the full build per request):
+--   * the functions from the screenshots are in this build now. most of the
+--     implementation was ALREADY here as dead code - the vmpos / vmunpos /
+--     vmchams locals inside the visuals do-block were never driven or connected,
+--     and the ProjectileInflict hook already reads hit_sound / hit_sound_instance
+--     / hit_sound_volume / hit_sound_speed - so this build only lacked the parts
+--     that turn them on:
+--   * FIX 1 - cheat.hitsounds was declared but never populated (hit_sound_instance
+--     defaulted to nil, "Hit sound" could never play anything). the 16 Sound
+--     instances + ContentProvider preload from the full build are created right
+--     after the cheat table - no ui elements, no element id (moneyblox_N) shifts,
+--     and it runs before the top-level hit_sound defaults read
+--     cheat.hitsounds["Bameware"].
+--   * FIX 2 - the ui: built at the very END of the ui build (same rule as every
+--     other appended feature, so no existing element id shifts). the Local
+--     section (Visuals > Misc) gets "Gun changer" (+ "Gun color" colorpicker +
+--     "Gun material" dropdown), "Arm changer" (+ "Arm color" + "Arm material")
+--     and "Viewmodel changer" (+ "X offset" / "Y offset" / "Z offset" sliders,
+--     applied instantly like the full build); the Effects/Logs section
+--     (Combat > Misc) gets "Hit sound" (+ "Hit sound volume" / "Hit sound speed"
+--     sliders + "Hit sound selection" dropdown). dependent controls show/hide
+--     with their toggle through the same State() mechanism the other sections
+--     use. the 14 new flags (gun_changer / gun_color / gun_material /
+--     arm_changer / arm_color / arm_material / viewmodel_changer / viewmodel_x /
+--     viewmodel_y / viewmodel_z / hit_sound / hit_sound_volume /
+--     hit_sound_speed / hit_sound_id) did not exist before, so old configs load
+--     exactly as before (LoadConfig skips unknown flags) and new ones save /
+--     reload them normally.
+--   * FIX 3 - the Camera wiring the full build had is connected:
+--     ChildAdded = vmpos (re-apply the offset on a fresh viewmodel),
+--     DescendantAdded = vmchams (gun / arm chams on new viewmodel parts),
+--     ChildRemoved = vmunpos (drop the saved weld C0s). all three disconnect
+--     through cheat.utility.on_unload, and Unload also puts the viewmodel welds
+--     back to their saved originals so unload returns the viewmodel to vanilla.
+--   * FIX 4 - the thirdperson keybind callback called the DEAD vmpos local (its
+--     viewmodel_changer can never turn true - always a no-op); it now routes
+--     through cheat.vmpos_apply so pressing thirdperson with "Viewmodel changer"
+--     on shoves the viewmodel away exactly like the full build (same early
+--     return when the changer is off, so nothing changes for anyone else).
+--   * the v22.8 autoload settle check now waits for "hit_sound_id" (the new LAST
+--     element created in the build) instead of "no_water_enabled", keeping the
+--     "last flag exists = whole ui exists" invariant true. GetConfig embeds
+--     _build = "moneyblox v23.13".
+--   * "No leafs" from the screenshot needs no port - this build has carried it
+--     since v23.2 (Visuals > Misc > View, flag view_no_leafs), unchanged.
+--   * nothing else was touched: same features, same element ids, same behavior;
+--     the old dead vmpos / vmchams / vmunpos copies in the visuals do-block stay
+--     exactly as they were.
 -- moneyblox | target hud replaced with the 789 (no dist / visor / tool) build's version, per request:
 --   * the Target hud card now renders exactly like that build: width 260px (fixed), bottom-center
 --     position (the card bottom sits 94px above the screen bottom), double border (inner frame +
@@ -2457,7 +2505,7 @@ local Library, Utility = LPH_JIT(function()
                         end
                 end
                 Library.LastSaveSkipped = skipped
-                Config["_build"] = "moneyblox v23.12"
+                Config["_build"] = "moneyblox v23.13"
                 return HttpService:JSONEncode(Config)
         end
 
@@ -2669,6 +2717,42 @@ local cheat = {
         hooks = {},
         hitsounds = {}
 }
+
+-- v23.13: populate the hitsounds table (the full build's 16 Sound instances +
+-- ContentProvider preload, ported verbatim). before this the table was declared
+-- but never filled, so the top-level hit_sound defaults below read
+-- cheat.hitsounds["Bameware"] as nil. no ui elements are created here, so no
+-- existing element id (moneyblox_N) shifts.
+do
+        local sounds = {}
+        for name, id in {
+                Bameware = "rbxassetid://3124331820",
+                Bell = "rbxassetid://6534947240",
+                Bubble = "rbxassetid://6534947588",
+                Pick = "rbxassetid://1347140027",
+                Pop = "rbxassetid://198598793",
+                Rust = "rbxassetid://1255040462",
+                Sans = "rbxassetid://3188795283",
+                Fart = "rbxassetid://130833677",
+                Big = "rbxassetid://5332005053",
+                Vine = "rbxassetid://5332680810",
+                Bruh = "rbxassetid://4578740568",
+                Skeet = "rbxassetid://5633695679",
+                Neverlose = "rbxassetid://6534948092",
+                Fatality = "rbxassetid://6534947869",
+                Bonk = "rbxassetid://5766898159",
+                Minecraft = "rbxassetid://4018616850",
+        } do
+                local sound = Instance.new("Sound")
+                sound.SoundId = id
+                cheat.hitsounds[name] = sound
+                table.insert(sounds, sound)
+        end
+
+        task.spawn(function()
+                game:GetService("ContentProvider"):PreloadAsync(sounds, function(...)end)
+        end)
+end
 
 
 local project_delta = {
@@ -8254,7 +8338,13 @@ do
 
                         local viewmodel = _FindFirstChildOfClass(Camera, "Model")
                         if viewmodel then
-                                vmpos(viewmodel)
+                                -- v23.13: the local vmpos here is dead code (its viewmodel_changer
+                                -- can never turn true), so route through the ported live vmpos -
+                                -- thirdperson now shoves the viewmodel away exactly like the full
+                                -- build. same early-return no-op when the changer is off.
+                                if cheat.vmpos_apply then
+                                        cheat.vmpos_apply(viewmodel)
+                                end
                         end
                 end})
                 tp_dist_slider = mscsec:Slider({Name = "Thirdperson distance", Min = 0, Max = 15, Float = 0.1, Value = 5, Flag = "view_thirdperson_distance", Callback = function(int)
@@ -14675,10 +14765,11 @@ do
                 -- v23.12: make sure the WHOLE ui - including the late Local-section
                 -- toggles (AntiMine / Auto loot / Remove water nearby) - has registered
                 -- its config flags before the autoload applies a file.
-                -- "no_water_enabled" is the LAST element created in the build, so once
-                -- its flag exists, every other flag exists too.
+                -- v23.13: "hit_sound_id" (Hit sound selection) is now the LAST element
+                -- created in the build, so once its flag exists, every other flag
+                -- exists too.
                 local settle_deadline = os.clock() + 5
-                while Library.ConfigFlags["no_water_enabled"] == nil and os.clock() < settle_deadline do
+                while Library.ConfigFlags["hit_sound_id"] == nil and os.clock() < settle_deadline do
                         task.wait(0.1)
                 end
 
@@ -16301,3 +16392,241 @@ end
                         no_water_restore_all()
                 end)
         end
+
+-- v23.13: "Gun changer" / "Arm changer" / "Viewmodel changer" / "Hit sound"
+-- (the functions from the screenshots, ported from the full build per request).
+-- self-contained late block, same pattern as the v22.7 Local section and the
+-- v23.1 MON-50 bypass: state lives here, the ui is built LAST so existing
+-- config element ids (moneyblox_N) never shift, and every connection is
+-- registered for Unload. the old dead vmpos / vmchams / vmunpos copies in the
+-- visuals do-block stay dead exactly as they were (untouched dead code).
+do
+        -- state (same names / defaults as the full build)
+        local viewmodel_changer, gun_changer, arm_changer = false, false, false
+        local gun_color, gun_material, arm_color, arm_material = Color3.new(1, 1, 1), Enum.Material.ForceField, Color3.new(1, 1, 1), Enum.Material.ForceField
+        local viewmodel_x, viewmodel_y, viewmodel_z = 0, 0, 0
+        local leftarm_old, rightarm_old, itemroot_old, motor6d_old
+
+        -- same weld-offset math as the full build: every weld gets
+        -- C0 = saved original + vec, so re-applying REPLACES the previous offset
+        -- instead of stacking on it, and a fresh viewmodel (new welds) starts
+        -- from its real original again. thirdperson key active = the viewmodel
+        -- is shoved out of the way (-100 y / +100 z) like the full build.
+        local function vmpos(vm)
+                if not viewmodel_changer then return end
+                local hrp = _FindFirstChild(vm, "HumanoidRootPart")
+                local vec = _Vector3new(viewmodel_x, thirdperson_key and -100 or viewmodel_y, thirdperson_key and 100 or viewmodel_z)
+                local leftarm_weld = hrp and _FindFirstChild(hrp, "LeftUpperArm")
+                local rightarm_weld = hrp and _FindFirstChild(hrp, "RightUpperArm")
+                local itemroot_weld = hrp and _FindFirstChild(hrp, "ItemRoot")
+                local motor6d_weld = hrp and _FindFirstChild(hrp, "Motor6D")
+                if leftarm_weld then
+                        if not leftarm_old then leftarm_old = leftarm_weld.C0 end
+                        leftarm_weld.C0 = leftarm_old + vec
+                end
+                if rightarm_weld then
+                        if not rightarm_old then rightarm_old = rightarm_weld.C0 end
+                        rightarm_weld.C0 = rightarm_old + vec
+                end
+                if itemroot_weld then
+                        if not itemroot_old then itemroot_old = itemroot_weld.C0 end
+                        itemroot_weld.C0 = itemroot_old + vec
+                end
+                if motor6d_weld then
+                        if not motor6d_old then motor6d_old = motor6d_weld.C0 end
+                        motor6d_weld.C0 = motor6d_old + vec
+                end
+        end
+        local function vmunpos()
+                if not viewmodel_changer then return end
+                leftarm_old, rightarm_old, motor6d_old = nil, nil, nil
+        end
+        local vmchams = LPH_NO_VIRTUALIZE(function()
+                local vm = _FindFirstChildOfClass(Camera, "Model")
+                if not vm then return end
+                local viewmodel_item = _FindFirstChild(vm, "Item")
+                if gun_changer and viewmodel_item then
+                        for _, v in viewmodel_item:GetDescendants() do
+                                local surfaceappearance = _FindFirstChildOfClass(v, "SurfaceAppearance")
+                                if _IsA(v, "BasePart") then
+                                        v.Material = gun_material
+                                        v.Color = gun_color
+                                end
+                                if surfaceappearance then
+                                        surfaceappearance:Destroy()
+                                end
+                        end
+                end
+                if arm_changer then
+                        for _, vm_item in vm:GetChildren() do
+                                if _IsA(vm_item, "BasePart") then
+                                        if vm_item.Name:find("Hand") or vm_item.Name:find("Arm") then
+                                                vm_item.Material = arm_material
+                                                vm_item.Color = arm_color
+                                        end
+                                end
+                                if vm_item.ClassName == "Model" and (_FindFirstChild(vm_item, "LL") or _FindFirstChild(vm_item, "LH")) then
+                                        for _, shirt_item in (vm_item:GetChildren()) do
+                                                local surfaceappearance = _FindFirstChildOfClass(shirt_item, "SurfaceAppearance")
+                                                shirt_item.Material = arm_material
+                                                shirt_item.Color = arm_color
+                                                if surfaceappearance then
+                                                        surfaceappearance:Destroy()
+                                                end
+                                        end
+                                end
+                        end
+                end
+        end)
+        -- the thirdperson keybind callback reads this (it called the dead local
+        -- vmpos before - see the v23.13 changelog)
+        cheat.vmpos_apply = vmpos
+
+        -- ui (built LAST so existing config element ids never shift - same rule
+        -- as every other feature appended before this one). the changers go to
+        -- the Local section (Visuals > Misc, right side) and the hit sound to
+        -- Effects/Logs (Combat > Misc, left side) - the same sections the full
+        -- build puts them in.
+        local lclsec = ui.sections.visuals_local
+        local effsec = ui.sections.aimbot_effects
+
+        -- Gun changer ---------------------------------------------------------
+        local gun_color_picker, gun_mat_dropdown = nil, nil
+        local gun_toggle = lclsec:Toggle({Name = "Gun changer", Value = false, Flag = "gun_changer", Callback = function(bool)
+                gun_changer = bool
+                local vis = bool and true or false
+                if gun_color_picker then gun_color_picker.State(vis) end
+                if gun_mat_dropdown then gun_mat_dropdown.State(vis) end
+        end})
+        gun_color_picker = lclsec:Colorpicker({Name = "Gun color", Value = Color3.new(1, 1, 1), Usealpha = false, Flag = "gun_color", Callback = function(color)
+                gun_color = color.c
+        end})
+        gun_color_picker.State(false)
+        gun_mat_dropdown = lclsec:Dropdown({Name = "Gun material", Values = {"ForceField", "Neon", "SmoothPlastic", "Glass"}, Value = "ForceField", Flag = "gun_material", Multi = false, Callback = function(str)
+                gun_material = str and Enum.Material[str] or Enum.Material.ForceField
+        end})
+        gun_mat_dropdown.State(false)
+
+        -- Arm changer -----------------------------------------------------------
+        local arm_color_picker, arm_mat_dropdown = nil, nil
+        local arm_toggle = lclsec:Toggle({Name = "Arm changer", Value = false, Flag = "arm_changer", Callback = function(bool)
+                arm_changer = bool
+                local vis = bool and true or false
+                if arm_color_picker then arm_color_picker.State(vis) end
+                if arm_mat_dropdown then arm_mat_dropdown.State(vis) end
+        end})
+        arm_color_picker = lclsec:Colorpicker({Name = "Arm color", Value = Color3.new(1, 1, 1), Usealpha = false, Flag = "arm_color", Callback = function(color)
+                arm_color = color.c
+        end})
+        arm_color_picker.State(false)
+        arm_mat_dropdown = lclsec:Dropdown({Name = "Arm material", Values = {"ForceField", "Neon", "SmoothPlastic", "Glass"}, Value = "ForceField", Flag = "arm_material", Multi = false, Callback = function(str)
+                arm_material = str and Enum.Material[str] or Enum.Material.ForceField
+        end})
+        arm_mat_dropdown.State(false)
+
+        -- Viewmodel changer ------------------------------------------------------
+        local vm_x_slider, vm_y_slider, vm_z_slider = nil, nil, nil
+        local vm_toggle = lclsec:Toggle({Name = "Viewmodel changer", Value = false, Flag = "viewmodel_changer", Callback = function(bool)
+                viewmodel_changer = bool
+                local vis = bool and true or false
+                if vm_x_slider then vm_x_slider.State(vis) end
+                if vm_y_slider then vm_y_slider.State(vis) end
+                if vm_z_slider then vm_z_slider.State(vis) end
+        end})
+        vm_x_slider = lclsec:Slider({Name = "X offset", Min = -5, Max = 5, Float = 0.1, Value = 0, Flag = "viewmodel_x", Callback = function(int)
+                viewmodel_x = int
+                if not viewmodel_changer then
+                        return
+                end
+                local viewmodel = _FindFirstChildOfClass(Camera, "Model")
+                if viewmodel then
+                        vmpos(viewmodel)
+                end
+        end})
+        vm_x_slider.State(false)
+        vm_y_slider = lclsec:Slider({Name = "Y offset", Min = -5, Max = 5, Float = 0.1, Value = 0, Flag = "viewmodel_y", Callback = function(int)
+                viewmodel_y = int
+                if not viewmodel_changer then
+                        return
+                end
+                local viewmodel = _FindFirstChildOfClass(Camera, "Model")
+                if viewmodel then
+                        vmpos(viewmodel)
+                end
+        end})
+        vm_y_slider.State(false)
+        vm_z_slider = lclsec:Slider({Name = "Z offset", Min = -5, Max = 5, Float = 0.1, Value = 0, Flag = "viewmodel_z", Callback = function(int)
+                viewmodel_z = int
+                if not viewmodel_changer then
+                        return
+                end
+                local viewmodel = _FindFirstChildOfClass(Camera, "Model")
+                if viewmodel then
+                        vmpos(viewmodel)
+                end
+        end})
+        vm_z_slider.State(false)
+
+        -- Hit sound ----------------------------------------------------------------
+        -- the trigger itself is untouched: the existing ProjectileInflict hook
+        -- already plays hit_sound_instance through SoundService (PlayOnRemove)
+        -- with hit_sound_volume / hit_sound_speed. only the ui is added here, and
+        -- the top-level hit_sound / hit_sound_instance / hit_sound_volume /
+        -- hit_sound_speed locals are still in scope at the end of the file.
+        local hitsound_volume_slider, hitsound_speed_slider, hitsound_selection_dropdown = nil, nil, nil
+        local hitsound_toggle = effsec:Toggle({Name = "Hit sound", Value = false, Flag = "hit_sound", Callback = function(bool)
+                hit_sound = bool
+                local vis = bool and true or false
+                if hitsound_volume_slider then hitsound_volume_slider.State(vis) end
+                if hitsound_speed_slider then hitsound_speed_slider.State(vis) end
+                if hitsound_selection_dropdown then hitsound_selection_dropdown.State(vis) end
+        end})
+        hitsound_volume_slider = effsec:Slider({Name = "Hit sound volume", Min = 0.1, Max = 10, Float = 0.1, Value = 1, Flag = "hit_sound_volume", Suffix = "", Callback = function(int)
+                hit_sound_volume = int
+        end})
+        hitsound_volume_slider.State(false)
+        hitsound_speed_slider = effsec:Slider({Name = "Hit sound speed", Min = 0.1, Max = 3, Float = 0.1, Value = 1, Flag = "hit_sound_speed", Suffix = "", Callback = function(int)
+                hit_sound_speed = int
+        end})
+        hitsound_speed_slider.State(false)
+        hitsound_selection_dropdown = effsec:Dropdown({Name = "Hit sound selection", Values = (function()
+                local hitsounds = {}
+                for name, _ in cheat.hitsounds do
+                        table.insert(hitsounds, name)
+                end
+                return hitsounds
+        end)(), Value = "Bameware", Flag = "hit_sound_id", Multi = false, Callback = function(str)
+                hit_sound_instance = cheat.hitsounds[str]
+        end})
+        hitsound_selection_dropdown.State(false)
+
+        -- viewmodel driver connections (same wiring as the full build)
+        local vm_child_added = Camera.ChildAdded:Connect(vmpos)
+        local vm_desc_added = Camera.DescendantAdded:Connect(vmchams)
+        local vm_child_removed = Camera.ChildRemoved:Connect(vmunpos)
+
+        -- unload: raw signal connections go through the on_unload registry (they
+        -- cannot live in the heartbeat tables), and the viewmodel welds go back
+        -- to their saved originals, so unload returns the viewmodel to vanilla
+        cheat.utility.on_unload(function()
+                pcall(function() vm_child_added:Disconnect() end)
+                pcall(function() vm_desc_added:Disconnect() end)
+                pcall(function() vm_child_removed:Disconnect() end)
+                pcall(function()
+                        local vm = _FindFirstChildOfClass(Camera, "Model")
+                        local hrp = vm and _FindFirstChild(vm, "HumanoidRootPart")
+                        if hrp then
+                                local w = _FindFirstChild(hrp, "LeftUpperArm")
+                                if w and leftarm_old then w.C0 = leftarm_old end
+                                w = _FindFirstChild(hrp, "RightUpperArm")
+                                if w and rightarm_old then w.C0 = rightarm_old end
+                                w = _FindFirstChild(hrp, "ItemRoot")
+                                if w and itemroot_old then w.C0 = itemroot_old end
+                                w = _FindFirstChild(hrp, "Motor6D")
+                                if w and motor6d_old then w.C0 = motor6d_old end
+                        end
+                end)
+                viewmodel_changer, gun_changer, arm_changer = false, false, false
+                leftarm_old, rightarm_old, itemroot_old, motor6d_old = nil, nil, nil, nil
+        end)
+end

@@ -1,6 +1,52 @@
 -- moneyblox | attachment viewer ported from the inventory-viewer build: gun mods render as item icon grids (pulled from the game's ItemsList) - icon size + position adjustable via the "Att. icon size" / "Att. size" / "Att. X" / "Att. Y" sliders
 -- moneyblox | functions trimmed + Unload + Linoria UI (Ardour style ui from violin-suzutsuki/LinoriaLib)
 -- fixed build: silent auto-shoot repaired (robust fire + fallback), legacy spin-mode toggle removed, Desync untouched
+-- v23.15 (target hud setup locked - size / position sliders removed, per request):
+--   * the "HUD width" / "HUD height (0 = auto)" / "HUD Y" sliders are gone
+--     from the menu. the values they were left at are now baked in as the
+--     fixed setup: card width 260px, card height 0 (auto-fit the content)
+--     and the card bottom sits 94px above the bottom of the screen (the
+--     previous default position was 72px).
+--   * the "HUD elements" dropdown and the "Target hud" toggle stay, and the
+--     card is still mouse-draggable for temporary moves.
+--   * config safe: hud_w / hud_h / hud_y keys an old config file may still
+--     carry are skipped by Library.LoadConfig (unknown flags are ignored),
+--     the same pattern as every earlier element removal.
+-- v23.14 (target hud position - new "HUD Y" slider, per request):
+--   * new "HUD Y" slider on the aimbot tab right under "HUD height
+--     (0 = auto)": it moves the Target hud card up / down the screen,
+--     same idea as the inventory viewer's "Viewer Y" slider. the value
+--     is the gap in px between the bottom of the card and the bottom of
+--     the screen (0 = flush with the bottom, 72 = the default spot just
+--     above the hotbar, higher = the card sits further up). the value is
+--     saved through the "hud_y" config flag like every other hud
+--     setting, and the card is still mouse-draggable - dragging simply
+--     overrides the slider until the slider is moved again.
+--   * nothing else was touched: same rows, same sizes, same default
+--     position until the slider is used.
+-- v23.13 (target hud cleanup - "Dist" / "Visor" / "Tool" rows removed per request):
+--   * the Target hud no longer renders the "Dist", "Visor" and "Tool" rows:
+--     the three field blocks are gone from the render loop (the player
+--     branch and the NPC branch for Dist), together with everything only
+--     they used - the visor inventory scan behind the Visor row (the 1 Hz
+--     stat-cache pass no longer walks the target's Inventory
+--     GetDescendants every refresh: small perf win), the EquippedTool
+--     lookup behind the Tool row, the sc.visor reset, the dead stat_cache
+--     visor / tool fields and the now unused gray / orange color locals.
+--   * the "HUD elements" dropdown loses the "Distance" / "Weapons" /
+--     "Visor" options and cheat.hud.show loses the dist / guns / visor
+--     keys, so no menu state or config can bring the rows back. config
+--     safe the same way as the v23.7 / v23.8 removals: LoadConfig keys by
+--     flag name and LinoriaLib's multi Dropdown:SetValue drops unknown
+--     values through table.find, so an old config that still lists
+--     "Distance" / "Weapons" / "Visor" loads without them and every other
+--     element keeps its saved value. the remaining eight rows (Avatar /
+--     Name / Vis / KDR / KD / Reports / Time / Health) render exactly as
+--     before.
+--   * the "Visor" element on the ESP tab and the aimbot / esp "Distance
+--     check" dropdowns are different features and are untouched, exactly
+--     as shipped. nothing else was touched: same features, same ids, same
+--     behavior.
 -- v23.12 (config load fix - "load config and these toggles stay off"):
 --   * LoadConfig is no longer one bad flag away from dying silently. the
 --     loader applied every flag setter unguarded and LinoriaLib's
@@ -5705,10 +5751,12 @@ do
 
                 cheat.hud = {
                         enabled = false,
-                        show = {viewport = true, name = true, dist = true, vis = true, kdr = true, kd = true, reps = true, time = true, hp = true, guns = true, visor = true},
+                        w = 260, -- card width in px (fixed value)
+                        user_h = 0, -- card height in px (0 = auto-fit, fixed value)
+                        show = {viewport = true, name = true, vis = true, kdr = true, kd = true, reps = true, time = true, hp = true}, -- v23.13: dist / guns / visor rows removed
                         target = nil,
                         seen = {},
-                        stat_cache = {name = nil, t = 0, kd = "?", kstr = "", hours = 0, reports = 0, visor = nil, tool = "NONE", tool_name = nil, tool_t = 0},
+                        stat_cache = {name = nil, t = 0, kd = "?", kstr = "", hours = 0, reports = 0}, -- v23.13: visor / tool fields removed with their rows
                         tick = 0
                 }
                 local hud_rows
@@ -5721,13 +5769,13 @@ do
                         cheat.hud.gui.ResetOnSpawn = false
                         cheat.hud.gui.Enabled = false
                         cheat.hud.gui.Parent = game:GetService("CoreGui")
-                        local hud_w = 190
+                        local hud_w = 260
                         cheat.hud.w = hud_w
                         local outer = Instance.new("Frame")
                         outer.Name = "Panel"
-                        local vp0 = Camera.ViewportSize
+                        outer.AnchorPoint = Vector2.new(0.5, 1) -- bottom-center anchor: the card sits in the middle of the screen like the reference
                         outer.Size = UDim2.fromOffset(hud_w, 120)
-                        outer.Position = UDim2.fromOffset(math.max(vp0.X - hud_w - 24, 0), math.max(vp0.Y - 150, 0))
+                        outer.Position = UDim2.new(0.5, 0, 1, -94) -- horizontally centered, 94px above the bottom of the screen (fixed)
                         outer.BackgroundColor3 = Color3.fromRGB(19, 19, 19)
                         outer.BorderSizePixel = 0
                         outer.Active = true
@@ -5737,6 +5785,18 @@ do
                         cheat.hud.stroke.Thickness = 1
                         cheat.hud.stroke.Color = Color3.fromRGB(40, 42, 44)
                         cheat.hud.stroke.Parent = outer
+                        -- second border line: the reference card has a double border
+                        cheat.hud.inner = Instance.new("Frame")
+                        cheat.hud.inner.Name = "inner"
+                        cheat.hud.inner.Position = UDim2.fromOffset(3, 3)
+                        cheat.hud.inner.Size = UDim2.new(1, -6, 1, -6)
+                        cheat.hud.inner.BackgroundTransparency = 1
+                        cheat.hud.inner.BorderSizePixel = 0
+                        cheat.hud.inner.Parent = outer
+                        local inner_stroke = Instance.new("UIStroke")
+                        inner_stroke.Thickness = 1
+                        inner_stroke.Color = Color3.fromRGB(40, 42, 44)
+                        inner_stroke.Parent = cheat.hud.inner
                         do
                                 local dragging = false
                                 local grab = Vector2.new()
@@ -5750,9 +5810,11 @@ do
                                 UserInputService.InputChanged:Connect(function(input)
                                         if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
                                                 local vs = Camera.ViewportSize
-                                                local nx = math.clamp(input.Position.X - grab.X, 0, math.max(vs.X - outer.AbsoluteSize.X, 0))
-                                                local ny = math.clamp(input.Position.Y - grab.Y, 0, math.max(vs.Y - outer.AbsoluteSize.Y, 0))
-                                                outer.Position = UDim2.fromOffset(nx, ny)
+                                                local size = outer.AbsoluteSize
+                                                -- anchor is (0.5, 1), so Position tracks the card's bottom-center point
+                                                local nx = math.clamp(input.Position.X - grab.X + size.X / 2, size.X / 2, math.max(vs.X - size.X / 2, size.X / 2))
+                                                local ny = math.clamp(input.Position.Y - grab.Y + size.Y, size.Y, math.max(vs.Y, size.Y))
+                                                outer.Position = UDim2.new(0, nx, 0, ny)
                                         end
                                 end)
                                 UserInputService.InputEnded:Connect(function(input)
@@ -5771,14 +5833,18 @@ do
                         cheat.hud.strip = strip
                         local avframe = Instance.new("Frame")
                         avframe.Name = "avatar"
-                        avframe.Position = UDim2.fromOffset(10, 8)
-                        avframe.Size = UDim2.fromOffset(26, 26)
+                        avframe.Position = UDim2.fromOffset(4, 4)
+                        avframe.Size = UDim2.fromOffset(62, 96)
                         avframe.BackgroundColor3 = Color3.fromRGB(40, 42, 44)
                         avframe.BorderSizePixel = 0
-                        avframe.Parent = outer
+                        avframe.Parent = cheat.hud.inner
+                        local av_stroke = Instance.new("UIStroke")
+                        av_stroke.Thickness = 1
+                        av_stroke.Color = Color3.fromRGB(50, 52, 54)
+                        av_stroke.Parent = avframe
                         cheat.hud.av = Instance.new("ImageLabel")
-                        cheat.hud.av.Position = UDim2.fromOffset(1, 1)
-                        cheat.hud.av.Size = UDim2.fromOffset(24, 24)
+                        cheat.hud.av.Position = UDim2.fromOffset(2, 2)
+                        cheat.hud.av.Size = UDim2.new(1, -4, 1, -4) -- portrait fills the avatar frame at every card height
                         cheat.hud.av.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
                         cheat.hud.av.BorderSizePixel = 0
                         cheat.hud.av.ScaleType = Enum.ScaleType.Crop
@@ -5788,11 +5854,11 @@ do
                         cheat.hud.rows = {}
                         for i = 1, 9 do
                                 local bg = Instance.new("Frame")
-                                bg.BackgroundColor3 = Color3.fromRGB(40, 42, 44)
+                                bg.BackgroundTransparency = 1 -- reference card: plain text rows, no boxes
                                 bg.BorderSizePixel = 0
-                                bg.Size = UDim2.fromOffset(140, 13)
+                                bg.Size = UDim2.fromOffset(176, 14)
                                 bg.Visible = false
-                                bg.Parent = outer
+                                bg.Parent = cheat.hud.inner
                                 local lbl = Instance.new("TextLabel")
                                 lbl.BackgroundTransparency = 1
                                 lbl.FontFace = Fonts.Get("TahomaXP")
@@ -5800,43 +5866,45 @@ do
                                 lbl.TextXAlignment = Enum.TextXAlignment.Left
                                 lbl.TextColor3 = Color3.fromRGB(150, 150, 150)
                                 lbl.TextStrokeTransparency = 1
-                                lbl.Position = UDim2.fromOffset(5, 0)
-                                lbl.Size = UDim2.new(1, -10, 1, 0)
+                                lbl.Position = UDim2.fromOffset(2, 0)
+                                lbl.Size = UDim2.new(1, -4, 1, 0)
                                 lbl.Parent = bg
                                 local val = Instance.new("TextLabel")
                                 val.BackgroundTransparency = 1
                                 val.FontFace = Fonts.Get("TahomaXP")
                                 val.TextSize = 10
-                                val.TextXAlignment = Enum.TextXAlignment.Right
+                                val.TextXAlignment = Enum.TextXAlignment.Left -- value column starts at a fixed offset like the reference card
                                 val.TextColor3 = Color3.fromRGB(230, 230, 230)
                                 val.TextStrokeTransparency = 1
                                 val.TextTruncate = Enum.TextTruncate.AtEnd
-                                val.Position = UDim2.fromOffset(5, 0)
-                                val.Size = UDim2.new(1, -10, 1, 0)
+                                val.Position = UDim2.fromOffset(52, 0)
+                                val.Size = UDim2.new(1, -54, 1, 0)
                                 val.Parent = bg
-                                bg.MouseEnter:Connect(function() bg.BackgroundColor3 = Color3.fromRGB(50, 52, 54) end)
-                                bg.MouseLeave:Connect(function() bg.BackgroundColor3 = Color3.fromRGB(40, 42, 44) end)
                                 cheat.hud.rows[i] = {bg = bg, lbl = lbl, val = val}
                         end
                         local hpbg = Instance.new("Frame")
                         hpbg.BackgroundColor3 = Color3.fromRGB(40, 42, 44)
                         hpbg.BorderSizePixel = 0
-                        hpbg.Size = UDim2.fromOffset(140, 13)
+                        hpbg.Size = UDim2.fromOffset(176, 14)
                         hpbg.Visible = false
                         hpbg.ClipsDescendants = true
-                        hpbg.Parent = outer
+                        hpbg.Parent = cheat.hud.inner
+                        local hp_stroke = Instance.new("UIStroke")
+                        hp_stroke.Thickness = 1
+                        hp_stroke.Color = Color3.fromRGB(50, 52, 54)
+                        hp_stroke.Parent = hpbg
                         cheat.hud.hp_fill = Instance.new("Frame")
                         cheat.hud.hp_fill.Size = UDim2.new(1, 0, 1, 0)
                         cheat.hud.hp_fill.BackgroundColor3 = Color3.fromRGB(75, 215, 95)
                         cheat.hud.hp_fill.BorderSizePixel = 0
                         cheat.hud.hp_fill.Parent = hpbg
                         cheat.hud.hp_t = Instance.new("TextLabel")
-                        cheat.hud.hp_t.Size = UDim2.new(1, -10, 1, 0)
+                        cheat.hud.hp_t.Size = UDim2.new(1, 0, 1, 0)
                         cheat.hud.hp_t.BackgroundTransparency = 1
                         cheat.hud.hp_t.FontFace = Fonts.Get("TahomaXP")
                         cheat.hud.hp_t.TextSize = 10
-                        cheat.hud.hp_t.Position = UDim2.fromOffset(5, 0)
-                        cheat.hud.hp_t.TextXAlignment = Enum.TextXAlignment.Right
+                        cheat.hud.hp_t.Position = UDim2.fromOffset(0, 0)
+                        cheat.hud.hp_t.TextXAlignment = Enum.TextXAlignment.Center -- "100 / 100" centered on the bar like the reference
                         cheat.hud.hp_t.TextColor3 = Color3.fromRGB(255, 255, 255)
                         cheat.hud.hp_t.TextStrokeTransparency = 1
                         cheat.hud.hp_t.Text = ""
@@ -5851,17 +5919,15 @@ do
                 local hud_element_keys = {
                         ["Avatar"] = "viewport",
                         ["Name"] = "name",
-                        ["Distance"] = "dist",
                         ["Vis"] = "vis",
                         ["KDR"] = "kdr",
                         ["KD"] = "kd",
                         ["Reports"] = "reps",
                         ["Time"] = "time",
                         ["Health"] = "hp",
-                        ["Weapons"] = "guns",
-                        ["Visor"] = "visor"
                 }
-                hud_elements_dropdown = effsec:Dropdown({Name = "HUD elements", Values = {"Avatar", "Name", "Distance", "Vis", "KDR", "KD", "Reports", "Time", "Health", "Weapons", "Visor"}, Value = {"Avatar", "Name", "Distance", "Vis", "KDR", "KD", "Reports", "Time", "Health", "Weapons", "Visor"}, Flag = "hud_elements", Multi = true, Callback = function(tbl)
+                -- v23.13: Distance / Weapons / Visor options removed
+                hud_elements_dropdown = effsec:Dropdown({Name = "HUD elements", Values = {"Avatar", "Name", "Vis", "KDR", "KD", "Reports", "Time", "Health"}, Value = {"Avatar", "Name", "Vis", "KDR", "KD", "Reports", "Time", "Health"}, Flag = "hud_elements", Multi = true, Callback = function(tbl)
                         for k, _ in cheat.hud.show do
                                 cheat.hud.show[k] = false
                         end
@@ -5873,6 +5939,11 @@ do
                         end
                 end})
                 hud_elements_dropdown.State(false)
+                -- v23.15: the "HUD width" / "HUD height (0 = auto)" / "HUD Y" sliders are
+                -- gone from the menu per request. the card runs on the fixed setup they
+                -- were left at: width 260px, height 0 (auto-fit the content) and the
+                -- bottom of the card 94px above the bottom of the screen. the card is
+                -- still mouse-draggable for temporary moves.
 
 
                 do
@@ -7429,17 +7500,15 @@ do
                                 vis = cheat.is_visible(Camera.CFrame.Position, ch, hrp) and true or false
                         end
                         local white = Color3.fromRGB(230, 230, 230)
-                        local gray = Color3.fromRGB(150, 150, 150)
                         local green = Color3.fromRGB(110, 220, 110)
                         local red = Color3.fromRGB(220, 90, 90)
-                        local orange = Color3.fromRGB(255, 170, 60)
                         local fields = {}
                         if is_player then
                                 local sc = cheat.hud.stat_cache
                                 if sc.name ~= pl.Name or now - sc.t > 0.5 then
                                         sc.name = pl.Name
                                         sc.t = now
-                                        sc.kd, sc.kstr, sc.hours, sc.reports, sc.visor = "?", "", 0, 0, nil
+                                        sc.kd, sc.kstr, sc.hours, sc.reports = "?", "", 0, 0
                                         pcall(function()
                                                 local folder = game:GetService("ReplicatedStorage"):FindFirstChild("Players")
                                                 local data = folder and folder:FindFirstChild(pl.Name)
@@ -7456,65 +7525,27 @@ do
                                                                 sc.reports = repf:GetAttribute("1") or 0
                                                         end
                                                 end
-                                                local inv = data and data:FindFirstChild("Inventory")
-                                                if inv then
-                                                        for _, obj in inv:GetDescendants() do
-                                                                if obj.Name:lower():find("visor", 1, true) then
-                                                                        local tog = obj:GetAttribute("Toggle")
-                                                                        if type(tog) == "boolean" then
-                                                                                sc.visor = tog
-                                                                                break
-                                                                        end
-                                                                end
-                                                        end
-                                                end
                                         end)
                                 end
                                 if cheat.hud.show.name then
-                                        table.insert(fields, {"user", pl.Name, white})
+                                        table.insert(fields, {"User", pl.Name, white})
                                 end
                                 if cheat.hud.show.kdr or cheat.hud.show.kd then
-                                        table.insert(fields, {"kd", sc.kd .. " " .. sc.kstr, white})
+                                        table.insert(fields, {"KD", sc.kd .. " " .. sc.kstr, white})
                                 end
                                 if cheat.hud.show.time then
-                                        table.insert(fields, {"play time", string.format("%.0fh", sc.hours), white})
-                                end
-                                if cheat.hud.show.guns then
-                                        local tool = "NONE"
-                                        pcall(function()
-                                                local folder = game:GetService("ReplicatedStorage"):FindFirstChild("Players")
-                                                local data = folder and folder:FindFirstChild(pl.Name)
-                                                local eq = data and data.Status.GameplayVariables:FindFirstChild("EquippedTool")
-                                                if eq and eq.Value then tool = eq.Value.Name end
-                                        end)
-                                        if tool == "NONE" and tp and tp.current_weapon then
-                                                tool = tp.current_weapon.Name or "NONE"
-                                        end
-                                        table.insert(fields, {"tool", string.lower(tool), white})
-                                end
-                                if cheat.hud.show.dist and hrp then
-                                        table.insert(fields, {"dist", math.floor((Camera.CFrame.Position - hrp.Position).Magnitude / 3) .. "m", white})
+                                        table.insert(fields, {"Play Time", string.format("%.0fh", sc.hours), white})
                                 end
                                 if cheat.hud.show.vis then
-                                        table.insert(fields, {"status", vis and "visible" or "hidden", vis and green or red})
+                                        table.insert(fields, {"Status", vis and "Visible" or "Hidden", vis and green or red})
                                 end
                                 if cheat.hud.show.reps then
-                                        table.insert(fields, {"reports", tostring(sc.reports), white})
-                                end
-                                if cheat.hud.show.visor then
-                                        if sc.visor == nil then
-                                                table.insert(fields, {"visor", "n/a", gray})
-                                        else
-                                                table.insert(fields, {"visor", sc.visor and "on" or "off", sc.visor and green or orange})
-                                        end
+                                        table.insert(fields, {"Reports", tostring(sc.reports), white})
                                 end
                         else
-                                table.insert(fields, {"user", ch and ch.Name or "?", white})
-                                if cheat.hud.show.dist and hrp then
-                                        table.insert(fields, {"dist", math.floor((Camera.CFrame.Position - hrp.Position).Magnitude / 3) .. "m", white})
-                                end
+                                table.insert(fields, {"User", ch and ch.Name or "?", white})
                                 if cheat.hud.show.vis then
-                                        table.insert(fields, {"status", vis and "visible" or "hidden", vis and green or red})
+                                        table.insert(fields, {"Status", vis and "Visible" or "Hidden", vis and green or red})
                                 end
                         end
                         local hp_c, hp_m = 0, 100
@@ -7525,43 +7556,54 @@ do
                         local show_hp = cheat.hud.show.hp
                         local show_av = cheat.hud.show.viewport and is_player
                         local n = #fields
-                        local row_h, gap, pad, x0 = 13, 2, 8, 10
-                        local right = cheat.hud.w - pad
-                        local top = pad
-                        local col_x, col_w = x0, right - x0
+                        -- reference-card layout: portrait avatar on the left (full card height), label/value rows on
+                        -- the right, health bar at the bottom of the value column - all coordinates are inner-frame
+                        -- local (inner = the frame inset 3px inside the panel)
+                        local row_h, gap, inset, pad, av_w = 14, 2, 3, 4, 62
+                        local inner_w = cheat.hud.w - inset * 2
+                        local rows_x, rows_w
                         if show_av then
-                                cheat.hud.avframe.Position = UDim2.fromOffset(x0, top)
-                                col_x = x0 + 26 + 6
-                                col_w = right - col_x
+                                rows_x = pad + av_w + 8
+                                rows_w = inner_w - rows_x - pad
+                        else
+                                rows_x = pad
+                                rows_w = inner_w - pad * 2
                         end
+                        local rows_h = n > 0 and (n * row_h + (n - 1) * gap) or 0
+                        local content_h = inset * 2 + pad * 2 + rows_h + (show_hp and (4 + row_h) or 0)
+                        -- card height (fixed value): 0 = auto-fit the content, any other value forces that card
+                        -- height (never smaller than the content needs); the extra space is split evenly
+                        -- above/below the rows + health bar so the block stays centered in the taller card
+                        local h = math.max(content_h, cheat.hud.user_h or 0)
+                        local y_off = math.floor((h - content_h) / 2)
                         for i = 1, n do
                                 local row = cheat.hud.rows[i]
                                 local f = fields[i]
                                 row.bg.Visible = f ~= nil
-                                row.bg.Position = UDim2.fromOffset(col_x, top + (i - 1) * (row_h + gap))
-                                row.bg.Size = UDim2.fromOffset(col_w, row_h)
+                                row.bg.Position = UDim2.fromOffset(rows_x, y_off + pad + (i - 1) * (row_h + gap))
+                                row.bg.Size = UDim2.fromOffset(rows_w, row_h)
                                 if f then
                                         row.lbl.Text = f[1]
                                         row.val.Text = f[2]
                                         row.val.TextColor3 = f[3]
                                 end
                         end
-                        local body_h = math.max(show_av and 26 or 0, n > 0 and (n * row_h + (n - 1) * gap) or 0)
-                        local h = top + body_h + pad
                         if show_hp then
-                                local hy = top + body_h + gap + 2
                                 cheat.hud.hp_bg.Visible = true
-                                cheat.hud.hp_bg.Position = UDim2.fromOffset(x0, hy)
-                                cheat.hud.hp_bg.Size = UDim2.fromOffset(right - x0, row_h)
+                                cheat.hud.hp_bg.Position = UDim2.fromOffset(show_av and rows_x or pad, y_off + pad + rows_h + 4)
+                                cheat.hud.hp_bg.Size = UDim2.fromOffset(show_av and rows_w or (inner_w - pad * 2), row_h)
                                 local k = math.clamp(hp_c / math.max(hp_m, 1), 0, 1)
                                 cheat.hud.hp_fill.Size = UDim2.new(k, 0, 1, 0)
                                 cheat.hud.hp_fill.BackgroundColor3 = k < 0.5 and Color3.fromRGB(225, 65, 65):Lerp(Color3.fromRGB(235, 200, 70), k / 0.5) or Color3.fromRGB(235, 200, 70):Lerp(Color3.fromRGB(75, 215, 95), (k - 0.5) / 0.5)
                                 cheat.hud.hp_t.Text = hp_c .. " / " .. hp_m
-                                h = hy + row_h + pad
                         else
                                 cheat.hud.hp_bg.Visible = false
                         end
                         cheat.hud.avframe.Visible = show_av
+                        if show_av then
+                                cheat.hud.avframe.Position = UDim2.fromOffset(pad, pad)
+                                cheat.hud.avframe.Size = UDim2.fromOffset(av_w, h - inset * 2 - pad * 2) -- portrait spans the whole card like the reference
+                        end
                         if show_av and typeof(pl) == "Instance" and pl:IsA("Player") then
                                 local thumb = "rbxthumb://type=AvatarBust&id=" .. pl.UserId .. "&w=150&h=150"
                                 if cheat.hud.av.Image ~= thumb then

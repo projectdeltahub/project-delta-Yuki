@@ -3438,13 +3438,15 @@ LPH_NO_VIRTUALIZE(function()
                 return _Vector2new(screen.X, screen.Y) + gui_inset, inBounds, screen.Z
         end
 
+        -- fps fix: the 8-slot corner buffer was table.create'ed on every call (per player per
+        -- frame); VERTICES is a constant so one buffer is allocated here and reused
+        local corners_buffer = table.create(#VERTICES)
         local function calculateCorners(cframe, size)
-                local corners = table.create(#VERTICES)
                 for i, vertice in VERTICES do
-                        corners[i] = worldToScreen((cframe + size * 0.5 * vertice).Position)
+                        corners_buffer[i] = worldToScreen((cframe + size * 0.5 * vertice).Position)
                 end
 
-                return _Vector2zeromin(Camera.ViewportSize, unpack(corners)), _Vector2zeromax(Vector2.zero, unpack(corners))
+                return _Vector2zeromin(Camera.ViewportSize, unpack(corners_buffer)), _Vector2zeromax(Vector2.zero, unpack(corners_buffer))
         end
 
         local create_esp, create_object_esp, create_corpse_esp, create_item_esp, destroy_esp;
@@ -3721,6 +3723,12 @@ LPH_NO_VIRTUALIZE(function()
                 local cham_vis_ok, cham_applied = true, false
                 local part_cache = table.create(15)
                 local last_dist_text, last_weapon_text, last_weapon_pos, last_hp_text, last_hp_frac = nil, nil, nil, nil, nil
+                -- fps fix caches live on the plr table (plr._*): pooling them there adds no
+                -- upvalues to plr.render (Lua caps 60 upvalues) - see the render body below
+                -- plr._pcpool   pooled {CFrame, Size} entries per body-part name
+                -- plr._lpx/_lpy/_lsx/_lsy  last holder rect written
+                -- plr._ldm/_lhi last rounded distance / hp ints
+                -- plr._cc/_cr/_ch        cached character / root / humanoid
 
                 function plr:forceupdate()
                         team_check, dead_check, dist_check, npc_check, visible_check = main_settings.team_check, main_settings.dead_check, main_settings.dist_check, main_settings.npc_check, main_settings.visible_check
@@ -3834,6 +3842,17 @@ LPH_NO_VIRTUALIZE(function()
                         setvis_cache = bool
 
                         main_holder.Visible = bool
+                        -- bug fix: the skeleton wireframe was never touched here - a dead /
+                        -- despawned / off-screen / out-of-range entity kept rendering the LAST
+                        -- drawn skeleton frozen in place (the game leaves ragdoll corpses with a
+                        -- live root, so the old lines never vanished). hide + drop the lines when
+                        -- the entity is hidden, restore the toggle state when it comes back.
+                        if bool then
+                                if not main_wireframe.Visible then main_wireframe.Visible = settings.skeleton end
+                        else
+                                if main_wireframe.Visible then main_wireframe.Visible = false end
+                                main_wireframe:Clear()
+                        end
                         for part, cham in chams_table do
                                 cham.cham.Adornee = bool and settings.chams and (not settings.chams_visible_only or cham_vis_ok) and part or nil
                         end
@@ -3898,8 +3917,22 @@ LPH_NO_VIRTUALIZE(function()
                         end
 
                         character = is_npc and plr_instance or plr_instance.Character
-                        root = is_helicopter and character.PrimaryPart or character and _FindFirstChild(character, "HumanoidRootPart")
-                        humanoid = character and _FindFirstChildOfClass(character, "Humanoid")
+                        -- fps fix: the HRP/Humanoid lookups ran per frame per player; the rig only
+                        -- changes on respawn, so they are cached per character (self-healing: if a
+                        -- part disappears it is re-found immediately, same behaviour as before)
+                        if character ~= plr._cc then
+                                plr._cc = character
+                                plr._cr = is_helicopter and character and character.PrimaryPart or character and _FindFirstChild(character, "HumanoidRootPart")
+                                plr._ch = character and _FindFirstChildOfClass(character, "Humanoid")
+                        else
+                                if plr._cr and plr._cr.Parent ~= character then
+                                        plr._cr = is_helicopter and character.PrimaryPart or _FindFirstChild(character, "HumanoidRootPart")
+                                end
+                                if plr._ch and plr._ch.Parent ~= character then
+                                        plr._ch = _FindFirstChildOfClass(character, "Humanoid")
+                                end
+                        end
+                        root, humanoid = plr._cr, plr._ch
 
                         if not (character and root and humanoid) then
                                 return plr:togglevis(false)
@@ -3935,14 +3968,30 @@ LPH_NO_VIRTUALIZE(function()
                         do
                                 local count = 0
                                 table.clear(part_cache) -- reuse table instead of allocating every frame
+                                local pool = plr._pcpool -- fps fix: reuse the inner tables instead of allocating ~15 per frame
+                                if not pool then pool = {} plr._pcpool = pool end
                                 for _, part in character:GetChildren() do
                                         if _IsA(part, "BasePart") and isBodyPart(part.Name) then
-                                                part_cache[part.Name] = {part.CFrame, part.Size}
+                                                local entry = pool[part.Name]
+                                                if not entry then
+                                                        entry = {}
+                                                        pool[part.Name] = entry
+                                                end
+                                                entry[1] = part.CFrame
+                                                entry[2] = part.Size
+                                                part_cache[part.Name] = entry
                                                 count = count + (1)
                                         end
                                 end
                                 if is_helicopter then
-                                        part_cache[root.Name] = {root.CFrame, root.Size}
+                                        local entry = pool[root.Name]
+                                        if not entry then
+                                                entry = {}
+                                                pool[root.Name] = entry
+                                        end
+                                        entry[1] = root.CFrame
+                                        entry[2] = root.Size
+                                        part_cache[root.Name] = entry
                                 end
                                 if count <= 0 then
                                         return plr:togglevis(false)
@@ -3982,15 +4031,27 @@ LPH_NO_VIRTUALIZE(function()
                         do
                                 local pos = topLeft
                                 local size = bottomRight - topLeft
-                                main_holder.Position = UDim2.fromOffset(pos.X - gui_inset.X, pos.Y - gui_inset.Y)
-                                main_holder.Size = UDim2.fromOffset(size.X, size.Y)
+                                -- fps fix: write the holder rect only when it actually moves (forces
+                                -- engine GUI relayout per player per frame otherwise)
+                                local px, py = pos.X - gui_inset.X, pos.Y - gui_inset.Y
+                                local sx, sy = size.X, size.Y
+                                if px ~= plr._lpx or py ~= plr._lpy then
+                                        plr._lpx, plr._lpy = px, py
+                                        main_holder.Position = UDim2.fromOffset(px, py)
+                                end
+                                if sx ~= plr._lsx or sy ~= plr._lsy then
+                                        plr._lsx, plr._lsy = sx, sy
+                                        main_holder.Size = UDim2.fromOffset(sx, sy)
+                                end
                         end
 
                         do
-                                local dist_text = mathround(humanoid_distance / 3) .. "m"
-                                if dist_text ~= last_dist_text then -- skip redundant Text writes (GUI relayout is expensive)
-                                        last_dist_text = dist_text
-                                        main_distance.Text = dist_text
+                                -- fps fix: compare the rounded ints first - the string is only built when the value changed
+                                local dist_m = mathround(humanoid_distance / 3)
+                                if dist_m ~= plr._ldm then
+                                        plr._ldm = dist_m
+                                        last_dist_text = dist_m .. "m"
+                                        main_distance.Text = last_dist_text
                                 end
                                 if weapon_enabled then
                                         local gun = is_npc and "???" or get_gun(plr_instance, character, humanoid)
@@ -4012,10 +4073,12 @@ LPH_NO_VIRTUALIZE(function()
                         end
 
                         do
-                                local hp_text = tostring(mathfloor(humanoid_health))
-                                if hp_text ~= last_hp_text then
-                                        last_hp_text = hp_text
-                                        main_health_text.Text = hp_text
+                                -- fps fix: compare the rounded int first - tostring only on change
+                                local hp_int = mathfloor(humanoid_health)
+                                if hp_int ~= plr._lhi then
+                                        plr._lhi = hp_int
+                                        last_hp_text = tostring(hp_int)
+                                        main_health_text.Text = last_hp_text
                                 end
                                 local hp_frac = 1 - humanoid_health / humanoid_max_health
                                 if hp_frac ~= last_hp_frac then
@@ -4136,6 +4199,7 @@ LPH_NO_VIRTUALIZE(function()
                 local main_part = _FindFirstChild(object, "UpperTorso")
                 local corpse_name = object.Name
                 local corpse_text_tick, last_corpse_text = 0, nil
+                -- fps fix: holder Position only written when it moves (cached on plr: no extra upvalues)
 
 
                 local dist_check, max_distance = main_settings.dist_check, main_settings.max_distance
@@ -4190,7 +4254,11 @@ LPH_NO_VIRTUALIZE(function()
                         plr:togglevis(true)
 
                         do
-                                main_holder.Position = UDim2.fromOffset(screen_pos.X - gui_inset.X, screen_pos.Y - gui_inset.Y)
+                                local cpx, cpy = screen_pos.X - gui_inset.X, screen_pos.Y - gui_inset.Y
+                                if cpx ~= plr._cpx or cpy ~= plr._cpy then -- fps fix: skip redundant Position writes (GUI relayout)
+                                        plr._cpx, plr._cpy = cpx, cpy
+                                        main_holder.Position = UDim2.fromOffset(cpx, cpy)
+                                end
 
                                 corpse_text_tick = corpse_text_tick + (delta)
                                 if corpse_text_tick >= 0.1 then -- text rebuilds at 10 Hz, position still tracks every frame
@@ -4320,6 +4388,7 @@ LPH_NO_VIRTUALIZE(function()
                 end
 
                 local item_value_cache, item_text_tick, last_item_text = nil, 0, nil
+                -- fps fix: cached ItemProperties handle + guarded Position writes (cached on plr: no extra upvalues)
                 local last_should_dur, last_curr_size, last_max_size = nil, nil, nil
 
                 plr.render = function(delta, camera_position, current_tick)
@@ -4353,18 +4422,29 @@ LPH_NO_VIRTUALIZE(function()
 
                         plr:togglevis(true)
 
+                        -- fps fix: the ItemProperties find + 4 GetAttribute reads used to run every
+                        -- frame per item; they only feed the 10 Hz text / durability bar, so they are
+                        -- read inside the 10 Hz block now (visual refresh cadence is unchanged)
                         local item_itemlist = main_value.Value
-                        local item_properties = item_itemlist and _FindFirstChild(item_itemlist, "ItemProperties")
-                        local item_amount = main_value:GetAttribute("Amount")
-                        local item_durability = main_value:GetAttribute("Durability")
-                        local item_maxdurability = main_value:GetAttribute("MaxDurability")
-                        local item_originalmaxdurability = item_properties and item_properties:GetAttribute("OriginalMaxDurability")
+                        local item_properties = plr._props
+                        if not (item_properties and item_properties.Parent == item_itemlist) then
+                                item_properties = item_itemlist and _FindFirstChild(item_itemlist, "ItemProperties")
+                                plr._props = item_properties
+                        end
                         do
-                                main_holder.Position = UDim2.fromOffset(screen_pos.X - gui_inset.X, screen_pos.Y - gui_inset.Y)
+                                local ipx, ipy = screen_pos.X - gui_inset.X, screen_pos.Y - gui_inset.Y
+                                if ipx ~= plr._ipx or ipy ~= plr._ipy then -- fps fix: skip redundant Position writes (GUI relayout)
+                                        plr._ipx, plr._ipy = ipx, ipy
+                                        main_holder.Position = UDim2.fromOffset(ipx, ipy)
+                                end
 
                                 item_text_tick = item_text_tick + (delta)
                                 if item_text_tick >= 0.1 then -- text rebuilds at 10 Hz, position still tracks every frame
                                         item_text_tick = item_text_tick % 0.1
+                                        local item_amount = main_value:GetAttribute("Amount")
+                                        local item_durability = main_value:GetAttribute("Durability")
+                                        local item_maxdurability = main_value:GetAttribute("MaxDurability")
+                                        local item_originalmaxdurability = item_properties and item_properties:GetAttribute("OriginalMaxDurability")
                                         local text_buffer = item_name
 
                                         if distance_enabled then
@@ -4381,21 +4461,21 @@ LPH_NO_VIRTUALIZE(function()
                                                 last_item_text = text_buffer
                                                 main_text.Text = text_buffer
                                         end
-                                end
-                        end
 
-                        local should_durability = durability_bar_enabled and item_durability and item_maxdurability
-                        if should_durability ~= last_should_dur then
-                                last_should_dur = should_durability
-                                durability_holder.Visible = should_durability
-                        end
-                        if should_durability then
-                                local curr_size = item_durability / item_originalmaxdurability
-                                local max_size = 1 - item_maxdurability / item_originalmaxdurability
-                                if curr_size ~= last_curr_size or max_size ~= last_max_size then
-                                        last_curr_size, last_max_size = curr_size, max_size
-                                        current_durability.Size = UDim2.new(curr_size, -2, 0, 1)
-                                        max_durability.Size = UDim2.new(max_size, max_size == 0 and 0 or -1, 0, 1)
+                                        local should_durability = durability_bar_enabled and item_durability and item_maxdurability
+                                        if should_durability ~= last_should_dur then
+                                                last_should_dur = should_durability
+                                                durability_holder.Visible = should_durability
+                                        end
+                                        if should_durability then
+                                                local curr_size = item_durability / item_originalmaxdurability
+                                                local max_size = 1 - item_maxdurability / item_originalmaxdurability
+                                                if curr_size ~= last_curr_size or max_size ~= last_max_size then
+                                                        last_curr_size, last_max_size = curr_size, max_size
+                                                        current_durability.Size = UDim2.new(curr_size, -2, 0, 1)
+                                                        max_durability.Size = UDim2.new(max_size, max_size == 0 and 0 or -1, 0, 1)
+                                                end
+                                        end
                                 end
                         end
                 end
@@ -4619,14 +4699,31 @@ do
         vischeck_params.CollisionGroup = "WeaponRay"
         vischeck_params.IgnoreWater = true
 
+        -- fps fix: every call used to allocate a fresh filter table and push it into
+        -- FilterDescendantsInstances, forcing an engine-side raycast filter rebuild per
+        -- call (this function runs up to twice per player every 3rd frame from the
+        -- ESP cache loop, plus on every aimbot / ESP vis check). the contents only
+        -- change when the character or the camera is replaced, so the engine filter
+        -- is rebuilt only then - the raycasts themselves are unchanged.
+        local vischeck_filter, vischeck_filter_char, vischeck_filter_camera = nil, nil, nil
+        local function vischeck_refresh_filter()
+                local char = LocalPlayer.Character
+                if vischeck_filter_char ~= char or vischeck_filter_camera ~= Camera then
+                        vischeck_filter_char = char
+                        vischeck_filter_camera = Camera
+                        vischeck_filter = { workspace.NoCollision, Camera, char }
+                        vischeck_params.FilterDescendantsInstances = vischeck_filter
+                end
+        end
+
         cheat.is_visible = LPH_NO_VIRTUALIZE(function(origin, target, target_part)
-                vischeck_params.FilterDescendantsInstances = { workspace.NoCollision, Camera, LocalPlayer.Character }
+                vischeck_refresh_filter()
                 local castresults = _Raycast(workspace, origin, target_part.Position - origin, vischeck_params)
                 return castresults and castresults.Instance and _IsDescendantOf(castresults.Instance, target), castresults
         end)
 
         cheat.is_pos_visible = LPH_NO_VIRTUALIZE(function(origin, target_pos, target)
-                vischeck_params.FilterDescendantsInstances = { workspace.NoCollision, Camera, LocalPlayer.Character }
+                vischeck_refresh_filter()
                 local castresults = _Raycast(workspace, origin, target_pos - origin, vischeck_params)
                 return castresults and castresults.Instance and _IsDescendantOf(castresults.Instance, target), castresults
         end)
@@ -4751,6 +4848,7 @@ do
                 local game_data, game_uac, game_clan, game_inventory
                 local game_uac_ref
                 local character, humanoid
+                local hum_char_cache -- fps fix: the Humanoid scan ran EVERY frame per player; it only needs re-finding when the character changes
                 local old_health
                 local slow_tick = 0
                 local vis_phase = player.UserId % 3
@@ -4817,7 +4915,12 @@ do
                                 player_object.visible = (hrp and is_visible(bullet_origin, character, hrp)) or (head and is_visible(bullet_origin, character, head))
                         end
 
-                        humanoid = _FindFirstChildOfClass(character, "Humanoid")
+                        if character ~= hum_char_cache then
+                                hum_char_cache = character
+                                humanoid = _FindFirstChildOfClass(character, "Humanoid")
+                        elseif humanoid and humanoid.Parent ~= character then
+                                humanoid = _FindFirstChildOfClass(character, "Humanoid")
+                        end
                         if not humanoid then return end
                         if not old_health then old_health = humanoid.Health end
                         local new_health = humanoid.Health
@@ -5722,11 +5825,11 @@ do
                                 eff_t = eff_t + (delta)
 
                                 if not cheat.crosshair then
-                                        ch_root.Visible = false
+                                        if ch_root.Visible then ch_root.Visible = false end -- fps fix: was written every frame even when already hidden
                                         was_locked = false
                                         return
                                 end
-                                ch_root.Visible = true
+                                if not ch_root.Visible then ch_root.Visible = true end
 
                                 local vs = Camera.ViewportSize
                                 local dest = _Vector2new(vs.X / 2, vs.Y / 2)
@@ -6614,6 +6717,383 @@ do
                         hit_sound_instance = cheat.hitsounds[str]
                 end})
                 hitsound_selection_dropdown.State(false)
+                -- moneyblox | item watchlist: pick the items you want (type in "Search item"
+                -- to filter the list) and get BOTTOM-LEFT toast cards in "<item> — <player>"
+                -- form when another player carries one, dies, leaves the game, or loots a
+                -- dead player's dropped item. card style = the stat-check toasts (Player
+                -- checker) but bottom-left and bigger (340px wide, TextSize 18). idle cost
+                -- is zero: nothing runs while the toggle is off, and while it is on the
+                -- scan only runs once per interval (Watch scan rate slider, default 5s).
+                do
+                    local watch_enabled = false
+                    local watch_items = {} -- wanted item names (hash set)
+                    local watch_all_values = {} -- every item name (dropdown list, sorted)
+                    local watch_filter = {} -- names matching the current search text
+                    local watch_search = ""
+                    local watch_state = {} -- player -> { items = name set, dead = bool }
+                    local watch_drops = {} -- dead player name -> { item = expiry time }
+                    local watch_cards = {} -- live toast cards, oldest first
+                    local watch_interval = 5 -- seconds between inventory scans
+                    local watch_ok_font, watch_font = pcall(function()
+                        return Font.fromEnum(Enum.Font.SourceSans)
+                    end)
+                    if not watch_ok_font then
+                        watch_font = Font.new("rbxasset://fonts/families/SourceSansPro.json")
+                    end
+                    local watch_tween_ok, tween_service = pcall(function()
+                        return game:GetService("TweenService")
+                    end)
+                    if not watch_tween_ok then
+                        tween_service = nil
+                    end
+                    local watch_tween_info = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+                    local WATCH_LIFE, WATCH_MAX = 7, 8
+                    local WATCH_WIDTH = 340 -- stat-check toasts are 280 wide; ours are bigger
+                
+                    -- bottom-left toast stack (same recipe as the stat-check toasts,
+                    -- mirrored to the left edge and enlarged)
+                    local watch_holder = Instance.new("Frame")
+                    watch_holder.Name = "ItemWatchlistAlerts"
+                    watch_holder.Parent = game:GetService("CoreGui").RobloxGui
+                    watch_holder.BackgroundTransparency = 1
+                    watch_holder.BorderSizePixel = 0
+                    watch_holder.AnchorPoint = Vector2.new(0, 1)
+                    watch_holder.Position = UDim2.new(0, 12, 1, -12)
+                    watch_holder.Size = UDim2.new(0, WATCH_WIDTH, 1, -24)
+                    watch_holder.ZIndex = 50
+                
+                    local watch_list = Instance.new("UIListLayout")
+                    watch_list.Padding = UDim.new(0, 6)
+                    watch_list.SortOrder = Enum.SortOrder.LayoutOrder
+                    watch_list.VerticalAlignment = Enum.VerticalAlignment.Bottom
+                    watch_list.Parent = watch_holder
+                
+                    local watch_order = 0
+                
+                    local function watch_slide(card, x_offset)
+                        if not (tween_service and card.Parent) then return end
+                        pcall(function()
+                            tween_service:Create(card, watch_tween_info, { Position = UDim2.new(x_offset, 0, 0, 0) }):Play()
+                        end)
+                    end
+                
+                    local function watch_drop(card)
+                        for index = #watch_cards, 1, -1 do
+                            if watch_cards[index] == card then
+                                table.remove(watch_cards, index)
+                                break
+                            end
+                        end
+                        if card.Parent then
+                            watch_slide(card, -1) -- slide out to the left
+                            task.delay(0.25, function()
+                                pcall(function() card:Destroy() end)
+                            end)
+                        end
+                    end
+                
+                    -- names must not break the rich text markup
+                    local function watch_escape(str)
+                        str = tostring(str)
+                        str = str:gsub("&", "&amp;")
+                        str = str:gsub("<", "&lt;")
+                        str = str:gsub(">", "&gt;")
+                        return str
+                    end
+                
+                    local function watch_notify(message, accent)
+                        if not watch_enabled then return end
+                        watch_order = watch_order + 1
+                
+                        while #watch_cards >= WATCH_MAX do
+                            watch_drop(watch_cards[1])
+                        end
+                
+                        -- card shell (same recipe as the stat-check toasts, just bigger)
+                        local card = Instance.new("TextButton")
+                        card.Name = "watch_toast"
+                        card.AutoButtonColor = false
+                        card.BackgroundColor3 = Color3.fromRGB(23, 25, 26)
+                        card.BackgroundTransparency = 0.4
+                        card.BorderColor3 = Color3.fromRGB(0, 0, 0)
+                        card.BorderSizePixel = 0
+                        card.LayoutOrder = watch_order
+                        card.Position = UDim2.new(-1, 0, 0, 0)
+                        card.Size = UDim2.new(0, WATCH_WIDTH, 0, 0)
+                        card.AutomaticSize = Enum.AutomaticSize.Y
+                        card.Text = ""
+                        card.Parent = watch_holder
+                
+                        local accent_bar = Instance.new("Frame")
+                        accent_bar.Name = "accent"
+                        accent_bar.Position = UDim2.new(0, 0, 0, 0)
+                        accent_bar.Size = UDim2.new(0, 3, 1, 0)
+                        accent_bar.BackgroundColor3 = accent or Color3.fromRGB(220, 100, 100)
+                        accent_bar.BorderColor3 = Color3.fromRGB(0, 0, 0)
+                        accent_bar.BorderSizePixel = 0
+                        accent_bar.Parent = card
+                
+                        local label = Instance.new("TextLabel")
+                        label.Name = "watch_text"
+                        label.FontFace = watch_font
+                        label.RichText = true
+                        label.Text = message
+                        label.TextColor3 = Color3.fromRGB(230, 230, 230)
+                        label.TextSize = 18
+                        label.TextWrapped = true
+                        label.TextXAlignment = Enum.TextXAlignment.Left
+                        label.TextYAlignment = Enum.TextYAlignment.Top
+                        label.BackgroundTransparency = 1
+                        label.Position = UDim2.new(0, 10, 0, 0)
+                        label.Size = UDim2.new(1, -22, 0, 0)
+                        label.AutomaticSize = Enum.AutomaticSize.Y
+                        label.Parent = card
+                
+                        local pad = Instance.new("UIPadding")
+                        pad.PaddingTop = UDim.new(0, 8)
+                        pad.PaddingBottom = UDim.new(0, 8)
+                        pad.Parent = label
+                
+                        watch_cards[#watch_cards + 1] = card
+                        watch_slide(card, 0) -- slide in from the left
+                        card.MouseButton1Click:Connect(function()
+                            watch_drop(card)
+                        end)
+                
+                        task.delay(WATCH_LIFE, function()
+                            watch_drop(card)
+                        end)
+                    end
+                
+                    -- attachments are Instances inside nested Folders under the weapon's
+                    -- Attachments folder (same walk the weapon display uses); skins only
+                    -- exist as the weapon's Skin attribute, never as child instances
+                    local function watch_collect(folder, into)
+                        for _, entry in folder:GetChildren() do
+                            if entry:IsA("Folder") then
+                                watch_collect(entry, into)
+                            elseif watch_items[entry.Name] then
+                                into[entry.Name] = true
+                            end
+                        end
+                    end
+                
+                    -- inventory diff at the scan rate: pass 1 records deaths (so same-scan
+                    -- loots resolve), pass 2 diffs wanted items and fires the alerts
+                    local watch_tick = 0
+                    cheat.utility.new_heartbeat(LPH_NO_VIRTUALIZE(function()
+                        if not watch_enabled then return end
+                        local now = os.clock()
+                        if now - watch_tick < watch_interval then return end
+                        watch_tick = now
+                
+                        for dead_name, items in pairs(watch_drops) do
+                            for item, expiry in pairs(items) do
+                                if expiry < now then
+                                    items[item] = nil
+                                end
+                            end
+                            if not next(items) then
+                                watch_drops[dead_name] = nil
+                            end
+                        end
+                
+                        for player in pairs(cheat.player_list) do
+                            if player ~= LocalPlayer then -- our own inventory never alerts
+                                local state = watch_state[player]
+                                if not state then
+                                    state = { items = {}, dead = false }
+                                    watch_state[player] = state
+                                end
+                                local is_dead = false
+                                if player.Character then
+                                    local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+                                    is_dead = humanoid ~= nil and humanoid.Health <= 0
+                                end
+                                if is_dead and not state.dead then
+                                    state.dead = true
+                                    if next(state.items) then
+                                        local dropped = {}
+                                        for item in pairs(state.items) do
+                                            dropped[item] = now + 120
+                                        end
+                                        watch_drops[player.Name] = dropped
+                                        for item in pairs(state.items) do
+                                            watch_notify('<font color="rgb(255,255,0)">' .. watch_escape(item) .. '</font> — <font color="rgb(255,80,80)">' .. watch_escape(player.Name) .. '</font> ตาย', Color3.fromRGB(220, 100, 100))
+                                        end
+                                    end
+                                elseif not is_dead then
+                                    state.dead = false
+                                end
+                            end
+                        end
+                
+                        for player, player_object in pairs(cheat.player_list) do
+                            if player ~= LocalPlayer then
+                                local state = watch_state[player]
+                                if state then
+                                    local inventory = player_object and player_object.inventory
+                                    local current = {}
+                                    if inventory then
+                                        for _, item in inventory:GetChildren() do
+                                            if watch_items[item.Name] then
+                                                current[item.Name] = true
+                                            end
+                                            -- worn skin: a string attribute on the weapon
+                                            local skin_name = item:GetAttribute("Skin")
+                                            if skin_name and watch_items[skin_name] then
+                                                current[skin_name] = true
+                                            end
+                                            -- container items keep their contents in an
+                                            -- Inventory folder
+                                            local sub = item:FindFirstChild("Inventory")
+                                            if sub then
+                                                for _, subitem in sub:GetChildren() do
+                                                    if watch_items[subitem.Name] then
+                                                        current[subitem.Name] = true
+                                                    end
+                                                end
+                                            end
+                                            -- attachments: nested folders under Attachments
+                                            local att = item:FindFirstChild("Attachments")
+                                            if att then
+                                                watch_collect(att, current)
+                                            end
+                                        end
+                                    end
+                
+                                    local new_items = {}
+                                    for item in pairs(current) do
+                                        if not state.items[item] then
+                                            new_items[item] = true
+                                        end
+                                    end
+                                    if next(new_items) then
+                                        for item in pairs(new_items) do
+                                            local owner = nil
+                                            for dead_name, items in pairs(watch_drops) do
+                                                if items[item] then
+                                                    owner = dead_name
+                                                    break
+                                                end
+                                            end
+                                            if owner and owner ~= player.Name then
+                                                watch_drops[owner][item] = nil
+                                                watch_notify('<font color="rgb(255,255,0)">' .. watch_escape(item) .. '</font> — <font color="rgb(120,255,120)">' .. watch_escape(player.Name) .. '</font> Pick', Color3.fromRGB(100, 220, 120))
+                                            else
+                                                watch_notify('<font color="rgb(255,255,0)">' .. watch_escape(item) .. '</font> — <font color="rgb(255,255,0)">' .. watch_escape(player.Name) .. '</font>', Color3.fromRGB(220, 180, 60))
+                                            end
+                                        end
+                                    end
+                                    state.items = current
+                                end
+                            end
+                        end
+                    end))
+                
+                    -- leave detection is event-driven (no polling at all)
+                    local watch_leave_conn = Players.PlayerRemoving:Connect(function(player)
+                        local state = watch_state[player]
+                        if state and next(state.items) then
+                            for item in pairs(state.items) do
+                                watch_notify('<font color="rgb(255,255,0)">' .. watch_escape(item) .. '</font> — <font color="rgb(200,200,200)">' .. watch_escape(player.Name) .. '</font> Leave', Color3.fromRGB(160, 160, 160))
+                            end
+                        end
+                        watch_state[player] = nil
+                    end)
+                    cheat.utility.on_unload(function()
+                        watch_leave_conn:Disconnect()
+                        table.clear(watch_cards)
+                        watch_holder:Destroy()
+                    end)
+                
+                    -- ui: Combat > Misc > Effects/Logs, sub-controls hide until the toggle is on
+                    local watch_dropdown, watch_searchbox = nil, nil
+                    local watch_toggle = effsec:Toggle({Name = "Item Finder", Value = false, Flag = "item_watchlist", Callback = function(bool)
+                        watch_enabled = bool
+                        local vis = bool and true or false
+                        if watch_searchbox then watch_searchbox.State(vis) end
+                        if watch_dropdown then watch_dropdown.State(vis) end
+                    end})
+                    watch_searchbox = effsec:Textbox({Name = "Search item", Value = "", Flag = "item_watchlist_search", Callback = function(text)
+                        watch_search = tostring(text or "")
+                        table.clear(watch_filter)
+                        local filtered = {}
+                        if watch_search ~= "" then
+                            local q = watch_search:lower()
+                            for _, name in ipairs(watch_all_values) do
+                                if name:lower():find(q, 1, true) then
+                                    filtered[#filtered + 1] = name
+                                    watch_filter[name] = true
+                                end
+                            end
+                        else
+                            for _, name in ipairs(watch_all_values) do
+                                filtered[#filtered + 1] = name
+                            end
+                        end
+                        watch_dropdown.Refresh(filtered)
+                        -- re-check the visible selection after the refresh (the external ui
+                        -- lib may wipe it); hidden-by-filter selections stay in watch_items
+                        local visible_sel = {}
+                        for _, name in ipairs(filtered) do
+                            if watch_items[name] then
+                                visible_sel[#visible_sel + 1] = name
+                            end
+                        end
+                        watch_dropdown.Set(visible_sel)
+                    end})
+                    watch_dropdown = effsec:Dropdown({Name = "Finder items", Values = (function()
+                        for _, entry in project_delta.itemslist:GetChildren() do
+                            watch_all_values[#watch_all_values + 1] = entry.Name
+                        end
+                        -- gun skins are not ItemsList entries; they live in
+                        -- ReplicatedStorage.Skins as Skins/<weapon>/<skin> folders
+                        local ok_skins, skins = pcall(function()
+                            return game:GetService("ReplicatedStorage"):FindFirstChild("Skins")
+                        end)
+                        if ok_skins and skins then
+                            local seen = {}
+                            for _, name in ipairs(watch_all_values) do
+                                seen[name] = true
+                            end
+                            for _, weapon in skins:GetChildren() do
+                                for _, skin in weapon:GetChildren() do
+                                    if not seen[skin.Name] then
+                                        seen[skin.Name] = true
+                                        watch_all_values[#watch_all_values + 1] = skin.Name
+                                    end
+                                end
+                            end
+                        end
+                        table.sort(watch_all_values)
+                        return watch_all_values
+                    end)(), Value = {}, Flag = "item_watchlist_items", Multi = true, Callback = function(list)
+                        -- the ui passes an ARRAY of the selected (visible) values; anything
+                        -- hidden by the active search filter stays selected
+                        local keep = {}
+                        if watch_search ~= "" then
+                            for name in pairs(watch_items) do
+                                if not watch_filter[name] then
+                                    keep[name] = true
+                                end
+                            end
+                        end
+                        table.clear(watch_items)
+                        for _, name in ipairs(list or {}) do
+                            watch_items[name] = true
+                        end
+                        for name in pairs(keep) do
+                            watch_items[name] = true
+                        end
+                    end})
+                    watch_searchbox.State(false)
+                    watch_dropdown.State(false)
+                    effsec:Slider({Name = "Watch scan rate", Min = 0.5, Max = 10, Float = 0.5, Value = 5, Flag = "item_watchlist_rate", Suffix = "s", Callback = function(int)
+                        watch_interval = int
+                    end}).State(false)
+                end
+
 
 
                 local make_beam = cheat.make_beam
@@ -6846,22 +7326,54 @@ do
                         traj_params.FilterType = Enum.RaycastFilterType.Exclude
                         traj_params.IgnoreWater = false
                         traj_params.CollisionGroup = "WeaponRay"
-                        local function traj_ignore()
-                                local list = {LocalPlayer.Character, Camera, workspace.NoCollision, traj_folder}
-                                pcall(function()
-                                        for _, v in require(game:GetService("ReplicatedStorage").Modules.UniversalTables).ReturnTable("GlobalIgnoreListProjectile") do
-                                                table.insert(list, v)
-                                        end
-                                end)
-                                return list
+                        -- fps fix: the old traj_ignore() ran on EVERY sim step (one new table +
+                        -- one new closure + a pcall + a require + a fresh engine-side filter
+                        -- rebuild per raycast - thousands of times per solve). the list contents
+                        -- only matter when the character respawns or the global list changes, so
+                        -- the filter is rebuilt at most once per second (or on character change)
+                        -- instead of per step. the raycasts themselves are untouched.
+                        local traj_ignore_list, traj_ignore_char, traj_ignore_tick = nil, nil, 0
+                        local function traj_refresh_filter()
+                                local now = tick()
+                                local char = LocalPlayer.Character
+                                if traj_ignore_char ~= char or now - traj_ignore_tick > 1 then
+                                        traj_ignore_char = char
+                                        traj_ignore_tick = now
+                                        traj_ignore_list = {char, Camera, workspace.NoCollision, traj_folder}
+                                        pcall(function()
+                                                for _, v in require(game:GetService("ReplicatedStorage").Modules.UniversalTables).ReturnTable("GlobalIgnoreListProjectile") do
+                                                        table.insert(traj_ignore_list, v)
+                                                end
+                                        end)
+                                        traj_params.FilterDescendantsInstances = traj_ignore_list
+                                end
                         end
+                        -- fps fix: the ReplicatedStorage folder chain + string scans used to run
+                        -- every 30 Hz tick; now the chain is only re-walked when the handle is
+                        -- gone and the info is recomputed only when the equipped item changes.
+                        -- tool.Value is still read every call, so swapping grenades is picked up
+                        -- immediately (same results as before).
+                        local gi_tool_ref, gi_last_equipped, gi_cache = nil, nil, nil
+                        local gi_compute
                         local function grenade_info()
-                                local folder = game:GetService("ReplicatedStorage"):FindFirstChild("Players")
-                                local data = folder and folder:FindFirstChild(LocalPlayer.Name)
-                                local status = data and data:FindFirstChild("Status")
-                                local vars = status and status:FindFirstChild("GameplayVariables")
-                                local tool = vars and vars:FindFirstChild("EquippedTool")
+                                local tool = gi_tool_ref
+                                if not (tool and tool.Parent) then
+                                        local folder = game:GetService("ReplicatedStorage"):FindFirstChild("Players")
+                                        local data = folder and folder:FindFirstChild(LocalPlayer.Name)
+                                        local status = data and data:FindFirstChild("Status")
+                                        local vars = status and status:FindFirstChild("GameplayVariables")
+                                        tool = vars and vars:FindFirstChild("EquippedTool")
+                                        gi_tool_ref = tool
+                                        gi_last_equipped = nil -- force recompute on a new handle
+                                end
                                 local equipped = tool and tool.Value
+                                if equipped ~= gi_last_equipped then
+                                        gi_last_equipped = equipped
+                                        gi_cache = gi_compute(equipped)
+                                end
+                                return gi_cache
+                        end
+                        function gi_compute(equipped)
                                 if not equipped then return nil end
                                 if grenade_data[equipped.Name] then
                                         local g = grenade_data[equipped.Name]
@@ -6882,24 +7394,27 @@ do
                                 return {name = props and props:GetAttribute("ItemName") or equipped.Name, fuse = fuse, is_rgo = impact, radius = radius, overhand_speed = 100, underhand_speed = 44, bounciness = 0.35}
                         end
                         local function grenade_sim(origin, vel, fuse, bounces, bounciness, is_impact)
+                                traj_refresh_filter() -- fps fix: once per sim, not once per step
                                 local t, pos, v = 0, origin, vel
                                 local normal = Vector3.new(0, 1, 0)
                                 local points = {pos}
                                 local grav = Vector3.new(0, -(workspace.Gravity or 80), 0)
                                 local n = 0
-                                while t < fuse and n <= bounces and #points < 120 do
+                                local pcount = 1
+                                while t < fuse and n <= bounces and pcount < 120 do
                                         local next_pos = pos + v * 0.035 + 0.5 * grav * 0.035 * 0.035
                                         local next_v = (v + grav * 0.035) * 0.995
                                         local delta = next_pos - pos
                                         if delta.Magnitude < 0.01 then break end
-                                        traj_params.FilterDescendantsInstances = traj_ignore()
                                         local hit = workspace:Raycast(pos, delta, traj_params)
                                         if not hit then
                                                 pos, v = next_pos, next_v
-                                                table.insert(points, pos)
+                                                pcount = pcount + 1
+                                                points[pcount] = pos
                                         else
                                                 normal = hit.Normal
-                                                table.insert(points, hit.Position)
+                                                pcount = pcount + 1
+                                                points[pcount] = hit.Position
                                                 if is_impact then break end
                                                 local mat = hit.Instance.Material and hit.Instance.Material.Name or "Default"
                                                 local keep, damp = 1, 0.75
@@ -7101,6 +7616,9 @@ do
                                 line_txt.Visible = false
                         end
                         local function traj_hide_line()
+                                -- fps fix: this ran at 30 Hz even when lineup was off; a cheap
+                                -- sentinel read skips the 83 redundant writes once everything is hidden
+                                if line_segs[1].Transparency == 1 and not line_dot.Visible then return end
                                 for i = 1, 80 do line_segs[i].Transparency = 1 end
                                 line_dot.Visible = false
                                 line_cdot.Visible = false
@@ -7148,7 +7666,7 @@ do
                                                         n = n + (1)
                                                 end
                                         end
-                                        for i = n, 120 do traj_segs[i].Transparency = 1 end
+                                        for i = n, 120 do local s = traj_segs[i]; if s.Transparency ~= 1 then s.Transparency = 1 end end
                                         local final = pts[#pts]
                                         if final then
                                                 local radius = info.radius or 8.5
@@ -7190,7 +7708,9 @@ do
                                                 traj_txt.Visible = false
                                         end
                                 else
-                                        for i = 1, 120 do traj_segs[i].Transparency = 1 end
+                                        if traj_segs[1].Transparency ~= 1 then -- sentinel: skip 120 writes when already hidden
+                                                for i = 1, 120 do traj_segs[i].Transparency = 1 end
+                                        end
                                         traj_ball.Visible = false
                                         traj_ring.Visible = false
                                         traj_fill.Visible = false
@@ -7219,7 +7739,7 @@ do
                                                                         n = n + (1)
                                                                 end
                                                         end
-                                                        for i = n, 80 do line_segs[i].Transparency = 1 end
+                                                        for i = n, 80 do local s = line_segs[i]; if s.Transparency ~= 1 then s.Transparency = 1 end end
                                                         local sp, on = _WorldToViewportPoint(Camera, Camera.CFrame.Position + dir * 100)
                                                         if on and sp.Z > 0 then
                                                                 local pulse = 1 + 0.15 * math.sin(tick() * 8)
@@ -8124,12 +8644,17 @@ do
                         vehicle_size_apply(gui, text, icon)
                 end
                 function vehicle_size_apply(gui, text, icon)
+                        -- fps fix: all five writes ran on every vehicle every tick; only write on change
                         local isize = math.clamp(cheat.vehicle_icon, 16, 120)
-                        gui.Size = UDim2.new(0, math.max(96, isize + 52), 0, (isize + 2) + math.max(18, cheat.vehicle_size + 10) + 4)
-                        icon.Size = UDim2.fromOffset(isize, isize)
-                        text.Position = UDim2.new(0, 0, 0, isize + 2)
-                        text.Size = UDim2.new(1, 0, 0, math.max(18, cheat.vehicle_size + 10))
-                        text.TextSize = cheat.vehicle_size
+                        local gsize = UDim2.new(0, math.max(96, isize + 52), 0, (isize + 2) + math.max(18, cheat.vehicle_size + 10) + 4)
+                        if gui.Size ~= gsize then gui.Size = gsize end
+                        local isize_off = UDim2.fromOffset(isize, isize)
+                        if icon.Size ~= isize_off then icon.Size = isize_off end
+                        local tpos = UDim2.new(0, 0, 0, isize + 2)
+                        if text.Position ~= tpos then text.Position = tpos end
+                        local tsize = UDim2.new(1, 0, 0, math.max(18, cheat.vehicle_size + 10))
+                        if text.Size ~= tsize then text.Size = tsize end
+                        if text.TextSize ~= cheat.vehicle_size then text.TextSize = cheat.vehicle_size end
                 end
                 local vehicle_text_slider, vehicle_icon_slider, vehicle_maxdist_slider = nil, nil, nil
                 local vehicle_toggle = othsec:Toggle({Name = "Vehicle esp", Value = false, Flag = "esp_vehicles", Callback = function(bool)
@@ -8166,6 +8691,7 @@ do
                 end})
                 vehicle_maxdist_slider.State(false)
                 local vehicle_tick = 0
+                local vehicle_last_dist = {} -- fps fix: last rendered distance per vehicle
                 cheat.utility.new_renderstepped(function()
                         if not cheat.vehicle_esp then return end
                         local now = os.clock()
@@ -8192,8 +8718,11 @@ do
                                                         gui.Enabled = false
                                                 else
                                                         gui.Enabled = true
-                                                        text.Text = tostring(dist) .. "m"
-                                                        text.TextColor3 = cheat.vehicle_color
+                                                        if vehicle_last_dist[vehicle] ~= dist then -- fps fix: text write only when the distance changes
+                                                                vehicle_last_dist[vehicle] = dist
+                                                                text.Text = tostring(dist) .. "m"
+                                                        end
+                                                        if text.TextColor3 ~= cheat.vehicle_color then text.TextColor3 = cheat.vehicle_color end
                                                         vehicle_size_apply(gui, text, icon)
                                                 end
                                         end
@@ -8244,8 +8773,11 @@ do
                         for _, v in viewmodel_item:GetDescendants() do
                                 local surfaceappearance = _FindFirstChildOfClass(v, "SurfaceAppearance")
                                 if _IsA(v, "BasePart") then
-                                        v.Material = gun_material
-                                        v.Color = gun_color
+                                        -- fps fix: change-guarded writes - the unguarded rewrite of
+                                        -- Material / Color on every part of the gun on every pass is
+                                        -- what jerked the FPS while holding a weapon
+                                        if v.Material ~= gun_material then v.Material = gun_material end
+                                        if v.Color ~= gun_color then v.Color = gun_color end
                                 end
                                 if surfaceappearance then
                                         surfaceappearance:Destroy()
@@ -8256,15 +8788,15 @@ do
                         for _, vm_item in vm:GetChildren() do
                                 if _IsA(vm_item, "BasePart") then
                                         if vm_item.Name:find("Hand") or vm_item.Name:find("Arm") then
-                                                vm_item.Material = arm_material
-                                                vm_item.Color = arm_color
+                                                if vm_item.Material ~= arm_material then vm_item.Material = arm_material end
+                                                if vm_item.Color ~= arm_color then vm_item.Color = arm_color end
                                         end
                                 end
                                 if vm_item.ClassName == "Model" and (_FindFirstChild(vm_item, "LL") or _FindFirstChild(vm_item, "LH")) then
                                         for _, shirt_item in (vm_item:GetChildren()) do
                                                 local surfaceappearance = _FindFirstChildOfClass(shirt_item, "SurfaceAppearance")
-                                                shirt_item.Material = arm_material
-                                                shirt_item.Color = arm_color
+                                                if shirt_item.Material ~= arm_material then shirt_item.Material = arm_material end
+                                                if shirt_item.Color ~= arm_color then shirt_item.Color = arm_color end
                                                 if surfaceappearance then
                                                         surfaceappearance:Destroy()
                                                 end
@@ -8280,9 +8812,30 @@ do
         -- run. raw signal connections are registered with
         -- cheat.utility.on_unload so Unload disconnects them (same convention
         -- as every other raw connection in this build).
+        -- fps fix: vmchams used to be wired DIRECTLY to Camera.DescendantAdded -
+        -- holding a gun fires that signal constantly (equip / reload / effect
+        -- spawns) and every single event synchronously re-walked the whole item
+        -- tree and rewrote Material / Color on every part, which jerked the FPS.
+        -- now events only raise a dirty flag and ONE throttled pass (max 10 Hz)
+        -- applies them; with both changers off nothing runs at all.
+        local vm_dirty, vm_last_chams = false, 0
         local vm_conn_child = Camera.ChildAdded:Connect(vmpos)
-        local vm_conn_desc = Camera.DescendantAdded:Connect(vmchams)
+        local vm_conn_desc = Camera.DescendantAdded:Connect(function()
+                if gun_changer or arm_changer then vm_dirty = true end
+        end)
         local vm_conn_removed = Camera.ChildRemoved:Connect(vmunpos)
+        cheat.utility.new_heartbeat(LPH_NO_VIRTUALIZE(function()
+                if not vm_dirty then return end
+                if not (gun_changer or arm_changer) then
+                        vm_dirty = false
+                        return
+                end
+                local now = tick()
+                if now - vm_last_chams < 0.1 then return end
+                vm_last_chams = now
+                vm_dirty = false
+                vmchams()
+        end))
         cheat.utility.on_unload(function()
                 pcall(function() vm_conn_child:Disconnect() end)
                 pcall(function() vm_conn_desc:Disconnect() end)
@@ -8294,12 +8847,14 @@ do
         -- of this scope, so the ui callbacks write them through these setters).
         -- names / flags / behavior are identical to the full build.
         cheat.vm_changer_api = {
-                set_gun_changer = function(v) gun_changer = v end,
-                set_gun_color = function(v) gun_color = v end,
-                set_gun_material = function(v) gun_material = v end,
-                set_arm_changer = function(v) arm_changer = v end,
-                set_arm_color = function(v) arm_color = v end,
-                set_arm_material = function(v) arm_material = v end,
+                -- toggles / color / material changes raise vm_dirty so the throttled pass
+                -- applies them within 100 ms instead of waiting for the next camera event
+                set_gun_changer = function(v) gun_changer = v; vm_dirty = true end,
+                set_gun_color = function(v) gun_color = v; vm_dirty = true end,
+                set_gun_material = function(v) gun_material = v; vm_dirty = true end,
+                set_arm_changer = function(v) arm_changer = v; vm_dirty = true end,
+                set_arm_color = function(v) arm_color = v; vm_dirty = true end,
+                set_arm_material = function(v) arm_material = v; vm_dirty = true end,
                 set_viewmodel_changer = function(v) viewmodel_changer = v end,
                 get_viewmodel_changer = function() return viewmodel_changer end,
                 set_viewmodel_x = function(v) viewmodel_x = v end,
@@ -8967,8 +9522,8 @@ do
                                                                                 local hps = maxhp > 0 and (" " .. math.floor(hp / maxhp * 100) .. "%") or (hp > 0 and (" " .. hp) or "")
                                                                                 local brow = boss_rows[model.Name]
                                                                                 if brow then
+                                                                                        if not brow.row.Visible then brow.row.Visible = true end -- fps fix: was written every pass
                                                                                         brow.info.Text = (zone.Name or "?") .. "  " .. dist .. "m" .. hps
-                                                                                        brow.row.Visible = true
                                                                                         local k = maxhp > 0 and math.clamp(hp / maxhp, 0, 1) or 1
                                                                                         brow.bar.Size = UDim2.new(k, 0, 1, 0)
                                                                                         brow.bar.BackgroundColor3 = k < 0.5 and Color3.fromRGB(225, 65, 65):Lerp(Color3.fromRGB(235, 200, 70), k / 0.5) or Color3.fromRGB(235, 200, 70):Lerp(Color3.fromRGB(75, 215, 95), (k - 0.5) / 0.5)
@@ -8976,9 +9531,11 @@ do
                                                                         end
                                                                 end
                                                         end
-                                                        if #model:GetChildren() > 0 then
-                                                                scan_boss_zone(model, depth + 1)
-                                                        end
+                                                        -- fps fix: the old `#model:GetChildren() > 0` check allocated a table
+                                                        -- just for an emptiness test and the recursion allocated another -
+                                                        -- recursing unconditionally iterates an empty table as a no-op,
+                                                        -- halving the per-node garbage with identical behaviour
+                                                        scan_boss_zone(model, depth + 1)
                                                 end
                                         end
                                 if zones then
@@ -9429,27 +9986,57 @@ do
                 local LeftShoulderDefaultC0 = CFrame.new(-1, 0.5, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)
 
                 local update_neck_loop = function(Character)
+                        -- fps fix: this loop ran forever at 60 Hz doing ~10 instance lookups and
+                        -- 4-5 Motor6D.C0 lerp writes per tick, even with thirdperson OFF (where the
+                        -- pose is only lerped back to the default and every further write writes
+                        -- the same values). now the rig is cached per character (self-healing on
+                        -- parent changes), and once the idle pose has fully returned to the
+                        -- defaults the writes pause: a cheap exact-equality drift check re-enables
+                        -- them the moment anything moves the pose, and a 1 Hz re-check pulls a
+                        -- freshly re-equiped gun Motor6D back to the idle target like before.
+                        -- the UpAngle attribute logic and every lerp target are untouched.
+                        local m_head, m_humanoid, m_upper_torso, m_ra, m_la, m_waist, m_neck, m_rs, m_ls, m_lookat
+                        local item_motors_tick = 0
+                        local idle_restored = false
+                        local c0_identity = CFrame.new(0, 0, 0)
+                        local function c0_near(c0, target)
+                                local d = c0.Position - target.Position
+                                if d.X * d.X + d.Y * d.Y + d.Z * d.Z > 1e-6 then return false end
+                                local l = c0.LookVector - target.LookVector
+                                return l.X * l.X + l.Y * l.Y + l.Z * l.Z < 1e-6
+                        end
                         while Character and LocalPlayer.Character == Character do
                                 local Delta, Head
-                                repeat
+                                if m_head and m_head.Parent == Character then
                                         Delta = task.wait(1/60) / 0.2
-                                        Head = _FindFirstChild(Character, "Head")
-                                until Head
-                                local Humanoid = _FindFirstChild(Character, "Humanoid")
-                                if not (Humanoid and Humanoid.Health ~= 0) then
+                                        Head = m_head
+                                else
+                                        repeat
+                                                Delta = task.wait(1/60) / 0.2
+                                                Head = _FindFirstChild(Character, "Head")
+                                        until Head
+                                        m_head = Head
+                                end
+                                if not (m_humanoid and m_humanoid.Parent == Character) then
+                                        m_humanoid = _FindFirstChild(Character, "Humanoid")
+                                end
+                                if not (m_humanoid and m_humanoid.Health ~= 0) then
                                         continue
                                 end
-                                local UpperTorso        = _FindFirstChild(Character, "UpperTorso")
-                                local RightUpperArm = _FindFirstChild(Character, "RightUpperArm")
-                                local LeftUpperArm  = _FindFirstChild(Character, "LeftUpperArm")
-                                if not (UpperTorso and RightUpperArm and LeftUpperArm) then continue end
-                                local Waist              = _FindFirstChild(UpperTorso, "Waist")
-                                local Neck                = _FindFirstChild(Head, "Neck")
-                                local RightShoulder = _FindFirstChild(RightUpperArm, "RightShoulder")
-                                local LeftShoulder  = _FindFirstChild(LeftUpperArm, "LeftShoulder")
-                                if not (Waist and Neck and RightShoulder and LeftShoulder) then continue end
+                                local Humanoid = m_humanoid
+                                if not (m_upper_torso and m_upper_torso.Parent == Character) then m_upper_torso = _FindFirstChild(Character, "UpperTorso") end
+                                if not (m_ra and m_ra.Parent == Character) then m_ra = _FindFirstChild(Character, "RightUpperArm") end
+                                if not (m_la and m_la.Parent == Character) then m_la = _FindFirstChild(Character, "LeftUpperArm") end
+                                if not (m_upper_torso and m_ra and m_la) then continue end
+                                if not (m_waist and m_waist.Parent == m_upper_torso) then m_waist = _FindFirstChild(m_upper_torso, "Waist") end
+                                if not (m_neck and m_neck.Parent == Head) then m_neck = _FindFirstChild(Head, "Neck") end
+                                if not (m_rs and m_rs.Parent == m_ra) then m_rs = _FindFirstChild(m_ra, "RightShoulder") end
+                                if not (m_ls and m_ls.Parent == m_la) then m_ls = _FindFirstChild(m_la, "LeftShoulder") end
+                                if not (m_waist and m_neck and m_rs and m_ls) then continue end
+                                local Waist, Neck, RightShoulder, LeftShoulder = m_waist, m_neck, m_rs, m_ls
 
-                                local LookAt = _FindFirstChild(Character, "LookAt")
+                                if not (m_lookat and m_lookat.Parent == Character) then m_lookat = _FindFirstChild(Character, "LookAt") end
+                                local LookAt = m_lookat
                                 if LookAt then
                                         local NewUpAngle
                                         if LookAt.Value then
@@ -9460,10 +10047,39 @@ do
                                         end
                                         Character:SetAttribute("UpAngle", NewUpAngle)
                                 end
-                                local UpAngle      = (thirdperson and thirdperson_key) and Character:GetAttribute("UpAngle") or 0
-                                local SideAngle  = (thirdperson and thirdperson_key) and Character:GetAttribute("SideAngle") or 0
-                                local HeadUpAngle   = (thirdperson and thirdperson_key) and Character:GetAttribute("HeadUpAngle") or 0
-                                local HeadSideAngle = (thirdperson and thirdperson_key) and Character:GetAttribute("HeadSideAngle") or 0
+                                local third_on = (thirdperson and thirdperson_key) and true or false
+                                if not third_on then
+                                        if idle_restored then
+                                                -- idle hold: resume the lerps the moment any pose motor moves
+                                                if Neck.C0 ~= NeckDefaultC0 or Waist.C0 ~= WaistDefaultC0
+                                                        or RightShoulder.C0 ~= RightShoulderDefaultC0 or LeftShoulder.C0 ~= LeftShoulderDefaultC0 then
+                                                        idle_restored = false
+                                                else
+                                                        -- 1 Hz: a re-equiped tool spawns a fresh Motor6D that the
+                                                        -- original loop kept pulling to the idle target - keep doing that
+                                                        local nowc = tick()
+                                                        if nowc - item_motors_tick > 1 then
+                                                                item_motors_tick = nowc
+                                                                for _, part in Character:GetChildren() do
+                                                                        if part.ClassName == "Model" and part:FindFirstChild("ItemRoot") then
+                                                                                local Motor6D = part.ItemRoot:FindFirstChild("Motor6D")
+                                                                                if Motor6D and not c0_near(Motor6D.C0, c0_identity) then
+                                                                                        idle_restored = false
+                                                                                        break
+                                                                                end
+                                                                        end
+                                                                end
+                                                        end
+                                                end
+                                                if idle_restored then continue end
+                                        end
+                                else
+                                        idle_restored = false
+                                end
+                                local UpAngle      = third_on and Character:GetAttribute("UpAngle") or 0
+                                local SideAngle  = third_on and Character:GetAttribute("SideAngle") or 0
+                                local HeadUpAngle   = third_on and Character:GetAttribute("HeadUpAngle") or 0
+                                local HeadSideAngle = third_on and Character:GetAttribute("HeadSideAngle") or 0
                                 local CalculatedCFrame = nil
                                 if Humanoid.SeatPart then
                                         if Humanoid.SeatPart.ClassName == "VehicleSeat" then
@@ -9493,6 +10109,24 @@ do
                                                                 Motor6D.C0 = Motor6D.C0:lerp(CFrame.new(0, 0, -UpAngle * 0.5) * CalculatedCFrame, Delta)
                                                         end
                                                 end
+                                        end
+                                end
+                                if not third_on then
+                                        -- just lerped back toward the defaults: once fully there, snap
+                                        -- exactly and pause the writes (identical end pose, no more churn)
+                                        local seat = Humanoid.SeatPart
+                                        if seat and seat.ClassName == "VehicleSeat" then
+                                                if c0_near(Neck.C0, NeckDefaultC0) then
+                                                        Neck.C0 = NeckDefaultC0
+                                                        idle_restored = true
+                                                end
+                                        elseif c0_near(Waist.C0, WaistDefaultC0) and c0_near(Neck.C0, NeckDefaultC0)
+                                                and c0_near(RightShoulder.C0, RightShoulderDefaultC0) and c0_near(LeftShoulder.C0, LeftShoulderDefaultC0) then
+                                                Waist.C0 = WaistDefaultC0
+                                                Neck.C0 = NeckDefaultC0
+                                                RightShoulder.C0 = RightShoulderDefaultC0
+                                                LeftShoulder.C0 = LeftShoulderDefaultC0
+                                                idle_restored = true
                                         end
                                 end
                         end
@@ -9872,6 +10506,7 @@ do
                         cheat.ignore_water = bool
                 end})
 
+        local spider_params, spider_params_char -- fps fix: reused raycast params instead of per-frame allocations
         cheat.utility.new_renderstepped(LPH_NO_VIRTUALIZE(function(delta)
                 if not (speedhack or jumphack or swim_override or (flyhack and flyhack_key) or (spiderman and spiderman_key)) then
                         return -- idle: no movement feature needs per-frame work
@@ -9931,11 +10566,16 @@ do
                         hrp.AssemblyLinearVelocity = _Vector3new(hmm.X, hrp.AssemblyLinearVelocity.Y, hmm.Z)
                 end
                 if spiderman and spiderman_key then
-                        local params = RaycastParams.new()
-                        params.FilterType = Enum.RaycastFilterType.Exclude
-                        params.FilterDescendantsInstances = {char, workspace.NoCollision}
-                        params.IgnoreWater = true
-                        local hit = workspace:Raycast(hrp.Position, hrp.CFrame.LookVector * 2, params)
+                        -- fps fix: RaycastParams.new() + a fresh filter table were allocated every frame;
+                        -- one params object is reused and the filter is only rebuilt when the character changes
+                        spider_params = spider_params or RaycastParams.new()
+                        spider_params.FilterType = Enum.RaycastFilterType.Exclude
+                        if spider_params_char ~= char then
+                                spider_params_char = char
+                                spider_params.FilterDescendantsInstances = {char, workspace.NoCollision}
+                        end
+                        spider_params.IgnoreWater = true
+                        local hit = workspace:Raycast(hrp.Position, hrp.CFrame.LookVector * 2, spider_params)
                         if hit and hit.Instance then
                                 local flat = _Vector3new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z)
                                 if flat.Magnitude > 0.01 then
@@ -9949,12 +10589,17 @@ do
                         end
                 end
         end))
+        local anti_drown_vars -- fps fix: the 4-step ReplicatedStorage chain ran on every heartbeat; folders don't move, cache them
         cheat.utility.new_heartbeat(function()
                 if not anti_drown then return end
-                local folder = game:GetService("ReplicatedStorage"):FindFirstChild("Players")
-                local data = folder and folder:FindFirstChild(LocalPlayer.Name)
-                local status = data and data:FindFirstChild("Status")
-                local vars = status and status:FindFirstChild("GameplayVariables")
+                local vars = anti_drown_vars
+                if not (vars and vars.Parent) then
+                        local folder = game:GetService("ReplicatedStorage"):FindFirstChild("Players")
+                        local data = folder and folder:FindFirstChild(LocalPlayer.Name)
+                        local status = data and data:FindFirstChild("Status")
+                        vars = status and status:FindFirstChild("GameplayVariables")
+                        anti_drown_vars = vars
+                end
                 if vars and vars:GetAttribute("Drowning") ~= false then
                         pcall(function()
                                 vars:SetAttribute("Drowning", false)
@@ -10056,6 +10701,9 @@ do
                 if nc_label.Text ~= text then nc_label.Text = text end
                 if nc_label.TextColor3 ~= color then nc_label.TextColor3 = color end
         end
+        -- fps fix caches: the status strings were rebuilt (string.format / concat) every heartbeat
+        -- even when nothing changed; they are only rebuilt when their source value changes
+        local nc_clip_pct, nc_clip_held, nc_last_err, nc_last_plan = nil, nil, nil, nil
         local nc_clip, nc_plan, nc_plan_err, nc_last_probe, nc_last_part, nc_part_time, nc_cooling, nc_cool_until = nil, nil, nil, 0, nil, 0, false, 0
         local function nc_kind_allowed(kind)
                 if type(cheat.nc_state.kinds) ~= "table" then return true end
@@ -10350,7 +10998,10 @@ do
                         if c then
                                 local h = math.max(0.001, c.uEnd - c.uStart)
                                 local pct = math.floor(math.clamp((c.u - c.uStart) / h, 0, 1) * 100)
-                                nc_status(c.held and ("CLIPPING %d%%  waiting on server"):format(pct) or ("CLIPPING %d%%"):format(pct), NC_MID)
+                                if pct ~= nc_clip_pct or c.held ~= nc_clip_held then -- fps fix: rebuild only on change
+                                        nc_clip_pct, nc_clip_held = pct, c.held
+                                        nc_status(c.held and ("CLIPPING %d%%  waiting on server"):format(pct) or ("CLIPPING %d%%"):format(pct), NC_MID)
+                                end
                         end
                         return
                 end
@@ -10369,10 +11020,16 @@ do
                         nc_cooling = false
                 end
                 if not nc_plan then
-                        nc_status(nc_plan_err and "NOT CLIPPABLE  " .. nc_plan_err or "NOT CLIPPABLE", nc_plan_err and NC_BAD or NC_IDLE)
+                        if nc_plan_err ~= nc_last_err then -- fps fix: rebuild only when the error changed
+                                nc_last_err = nc_plan_err
+                                nc_status(nc_plan_err and "NOT CLIPPABLE  " .. nc_plan_err or "NOT CLIPPABLE", nc_plan_err and NC_BAD or NC_IDLE)
+                        end
                         return
                 end
-                nc_status(("CLIPPABLE  %s %.1fst%s"):format(nc_plan.kind, nc_plan.t, (nc_plan.layers or 1) > 1 and (("  %d floors"):format(nc_plan.layers)) or ""), NC_OK)
+                if nc_plan ~= nc_last_plan then -- fps fix: plan object only changes on a probe (20 Hz), not per frame
+                        nc_last_plan = nc_plan
+                        nc_status(("CLIPPABLE  %s %.1fst%s"):format(nc_plan.kind, nc_plan.t, (nc_plan.layers or 1) > 1 and (("  %d floors"):format(nc_plan.layers)) or ""), NC_OK)
+                end
                 if nc_plan.part ~= nc_last_part then nc_last_part, nc_part_time = nc_plan.part, now end
                 if now - nc_part_time >= NC_DWELL and now >= nc_cool_until then
                         local q = nc_plan
